@@ -2847,7 +2847,7 @@ function setAboutHtml() {
     + '<div style="min-width:0"><div style="font-size:13.5px;font-weight:600">2xapi Codex Console <span class="tag">' + ver + '</span></div>'
     + '<div class="sub" style="margin-top:2px">让桌面版 Codex 一键走中转站</div></div></div>'
     + setRow('检查更新', '<button class="btn sm ghost" data-a="about-update"' + (state.checkingUpdate ? " disabled" : "") + '>' + (state.checkingUpdate ? "检查中…" : "检查") + '</button>', updHint)
-    + '<div class="sub" style="margin-top:10px">本软件为专有许可(Proprietary),仅供授权使用;Codex 与 Claude 的名称及图标归其各自所有方。</div>';
+    + '<div class="sub" style="margin-top:10px">本软件采用 MIT License；Codex 与 Claude 的名称及图标归其各自所有方。</div>';
 }
 async function doCheckUpdate(silent) {
   if (state.checkingUpdate) return;

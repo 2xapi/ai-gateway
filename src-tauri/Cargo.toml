@@ -1,9 +1,10 @@
 [package]
 name = "console-2xapi"
-version = "1.0.11"
+version = "1.0.12"
 edition = "2021"
 description = "2xapi Codex Console"
 repository = "https://github.com/2xapi/ai-gateway"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

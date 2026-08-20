@@ -2,7 +2,7 @@
 
 让桌面版 Codex(ChatGPT.app)一键走 API 中转站。面向小白用户:装好 → 选供应商 → 点一下,桌面版 Codex 立即开始走你的中转;官方登录、插件、订阅全部照常保留。
 
-> ⚠️ **专有许可**:本仓库代码**仅供公开查看与学习**。未经授权禁止复制、修改、分发、商用或二次开发。详见 [LICENSE](./LICENSE)。
+> 本项目采用 [MIT License](./LICENSE) 开源授权。第三方名称、Logo 和服务仍归各自权利人所有。
 
 ---
 
@@ -53,8 +53,6 @@ cargo build --release
 
 ## 许可证
 
-**专有许可 / Proprietary License** — Copyright (C) 2026 2xapi. All rights reserved.
-
-本仓库代码仅供公开查看与学习。任何复制、修改、分发、商业使用或二次开发均须事先获得 2xapi 书面授权。查看 [LICENSE](./LICENSE) 获取完整条款。
+本项目采用 MIT License，版权归 2xapi 所有。完整条款见 [LICENSE](./LICENSE)。
 
 商业合作与授权请联系 2xapi。

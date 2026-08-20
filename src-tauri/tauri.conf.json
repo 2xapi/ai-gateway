@@ -1,6 +1,6 @@
 {
   "productName": "2xapi Codex Console",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "identifier": "com.zhi.2xapi-codex-console",
   "build": {
     "frontendDist": "../frontend"
