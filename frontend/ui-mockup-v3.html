@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>方案 E — 极简 + 侧栏</title>
+<style>
+:root{--bg:#000;--side:#0c0e12;--card:#16191f;--hover:#1c2028;--border:#1e222a;--text:#f0f2f6;--muted:#5c6370;--blue:#5b8def;--green:#34d399;--orange:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:15px/1.6 -apple-system,"SF Pro Display","PingPing SC",sans-serif;height:100vh;overflow:hidden;display:flex;color:var(--text);background:var(--bg)}
+
+/* ── 左侧栏 ── */
+.sidebar{width:56px;background:var(--side);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:4px;flex-shrink:0}
+.sidebar .logo{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--blue),#7b6ef6);display:flex;align-items:center;justify-content:center;font-size:15px;margin-bottom:12px}
+.sidebar .nav{width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;color:var(--muted);transition:.15s;position:relative}
+.sidebar .nav:hover{background:var(--card);color:var(--text)}
+.sidebar .nav.active{background:rgba(91,141,239,.12);color:var(--blue)}
+.sidebar .nav.active::before{content:'';position:absolute;left:-14px;top:50%;transform:translateY(-50%);width:3px;height:18px;background:var(--blue);border-radius:0 3px 3px 0}
+.sidebar .sep{width:24px;height:1px;background:var(--border);margin:8px 0}
+.sidebar .pdot{width:6px;height:6px;border-radius:50%;margin:5px 0;cursor:pointer}
+.sidebar .pdot.g{background:var(--green)} .sidebar .pdot.b{background:var(--blue)} .sidebar .pdot.o{background:var(--orange)}
+
+/* ── 主区 ── */
+.main{flex:1;overflow-y:auto;display:flex;flex-direction:column;align-items:center;padding:28px 20px}
+.wrap{width:100%;max-width:480px}
+.header{text-align:center;margin-bottom:24px}
+.header h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
+.header .sub{font-size:12px;color:var(--muted);margin-top:3px}
+
+/* 激活状态 */
+.active-bar{background:rgba(52,211,153,.05);border:1px solid rgba(52,211,153,.12);border-radius:14px;padding:13px 18px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between}
+.active-bar .left{display:flex;align-items:center;gap:8px}
+.active-bar .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.4)}
+.active-bar .txt{font-size:13px} .active-bar .txt b{font-weight:600} .active-bar .txt .d{color:var(--muted)}
+.active-bar .btn{font-size:11px;color:var(--blue);cursor:pointer;padding:5px 12px;border:1px solid rgba(91,141,239,.25);border-radius:7px}
+
+/* 分区标签 */
+.label{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 8px 14px}
+
+/* 卡片 */
+.card{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:15px 18px;margin-bottom:7px;cursor:pointer;transition:.2s;display:flex;align-items:center;gap:12px}
+.card:hover{background:var(--hover);border-color:#2a2f3a}
+.card.active{background:linear-gradient(135deg,rgba(91,141,239,.06),transparent);border-color:rgba(91,141,239,.2)}
+.card .ico{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
+.card .ico.ds{background:rgba(91,141,239,.12)} .card .ico.ai{background:rgba(52,211,153,.1)} .card .ico.zp{background:rgba(251,191,36,.1)}
+.card .info{flex:1;min-width:0}
+.card .info .name{font-size:14px;font-weight:600;display:flex;align-items:center;gap:5px}
+.card .info .name .star{color:var(--blue);font-size:12px}
+.card .info .meta{font-size:11px;color:var(--muted);margin-top:1px}
+.card .mode{font-size:9px;padding:3px 9px;border-radius:999px;font-weight:600;flex-shrink:0}
+.mode.mixed{background:rgba(91,141,239,.12);color:var(--blue)}
+.mode.official{background:rgba(52,211,153,.1);color:var(--green)}
+.mode.pure{background:rgba(251,191,36,.1);color:var(--orange)}
+.card .arrow{color:var(--muted);font-size:14px}
+
+/* 新建 */
+.add{border:1.5px dashed var(--border);border-radius:13px;padding:14px;text-align:center;color:var(--muted);cursor:pointer;font-size:13px;transition:.2s;margin-top:4px}
+.add:hover{border-color:var(--blue);color:var(--blue);background:rgba(91,141,239,.03)}
+
+/* 底栏(可选,也可全放侧栏) */
+.bottom{margin-top:auto;padding-top:20px;text-align:center;font-size:11px;color:var(--muted)}
+</style></head>
+<body>
+<!-- 侧栏 -->
+<div class="sidebar">
+  <div class="logo">2x</div>
+  <div class="nav active" title="供应商">📋</div>
+  <div class="nav" title="工具箱">🛠</div>
+  <div class="nav" title="设置">⚙️</div>
+  <div class="sep"></div>
+  <div class="pdot g" title="DeepSeek"></div>
+  <div class="pdot b" title="OpenAI"></div>
+  <div class="pdot o" title="智谱"></div>
+</div>
+<!-- 主区 -->
+<div class="main">
+<div class="wrap">
+  <div class="header">
+    <h1>供应商</h1>
+    <div class="sub">管理你的 AI 模型接入</div>
+  </div>
+
+  <div class="active-bar">
+    <div class="left">
+      <span class="dot"></span>
+      <span class="txt"><b>DeepSeek</b> <span class="d">· Mixed · deepseek-chat</span></span>
+    </div>
+    <span class="btn">⇄ 切官方</span>
+  </div>
+
+  <div class="label">全部</div>
+
+  <div class="card active">
+    <div class="ico ds">🧠</div>
+    <div class="info">
+      <div class="name"><span class="star">★</span>DeepSeek</div>
+      <div class="meta">ChatCompletions · 2 模型 · 64K</div>
+    </div>
+    <span class="mode mixed">Mixed</span>
+    <span class="arrow">›</span>
+  </div>
+
+  <div class="card">
+    <div class="ico ai">✨</div>
+    <div class="info">
+      <div class="name">OpenAI</div>
+      <div class="meta">Responses · gpt-4o · 官方</div>
+    </div>
+    <span class="mode official">Official</span>
+    <span class="arrow">›</span>
+  </div>
+
+  <div class="card">
+    <div class="ico zp">🔮</div>
+    <div class="info">
+      <div class="name">智谱</div>
+      <div class="meta">Responses · glm-5.2 · 3 模型</div>
+    </div>
+    <span class="mode pure">PureApi</span>
+    <span class="arrow">›</span>
+  </div>
+
+  <div class="add">+ 添加供应商</div>
+  <div class="bottom">2xapi Codex Console v1.0 · 127.0.0.1:8787</div>
+</div>
+</div>
+</body></html>

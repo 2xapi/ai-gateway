@@ -1,0 +1,46 @@
+# 专有许可证 / Proprietary License
+
+Copyright (C) 2026 2xapi. All rights reserved.
+
+## 摘要(非法律文件,仅供快速理解)
+
+- 本仓库代码**仅供公开查看、学习与研究**。
+- **未经 2xapi 书面许可,禁止**任何形式的复制、修改、分发、再分发、商业使用,或基于本代码的任何二次开发/衍生作品。
+- 访问本仓库(查看 / Clone / Fork)**不构成任何使用授权**。
+
+## 条款 / Terms
+
+### 1. 授予的有限权利(Limited Grant)
+
+2xapi 授予任何访客**有限的、不可转让的、不可再许可的**权利,仅用于**查看与学习**本仓库代码。
+
+### 2. 禁止行为(Prohibited Uses)
+
+除上述查看与学习外,未经 2xapi 事先书面许可,任何人不得:
+
+1. 复制、拷贝、镜像、重构本代码的全部或任何部分;
+2. 修改、翻译、创建衍生作品,或基于本代码进行任何二次开发;
+3. 分发、出售、出租、再分发、托管或提供下载;
+4. 将本代码用于任何商业目的,或集成到任何产品、服务中;
+5. 移除、遮蔽、篡改本文件或任何版权声明。
+
+### 3. 版权与商标(Copyright & Trademarks)
+
+本仓库代码及其文档、名称、Logo 的版权与商标均归 2xapi 所有。
+
+### 4. 免责声明(Disclaimer)
+
+本代码按「现状」(AS-IS) 提供,不附带任何明示或默示的保证。2xapi 不对因使用或无法使用本代码而导致的任何直接、间接、偶然或连带损失承担责任。
+
+### 5. 授权(Authorization)
+
+任何超出上述有限权利的使用需求,请联系 2xapi 获取书面授权。
+
+---
+
+Copyright (C) 2026 2xapi. All rights reserved.
+
+This repository is provided for **public viewing and learning only**. Any copying,
+modification, distribution, commercial use, or creation of derivative works is
+**strictly prohibited** without prior written permission from 2xapi. Accessing or
+forking this repository does not grant any license to use the code.

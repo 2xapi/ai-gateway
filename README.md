@@ -1,168 +1,60 @@
-# AI Gateway
+# 2xapi Codex Console
 
-A unified API gateway for multiple AI service providers with intelligent rate limiting, caching, and routing capabilities.
+让桌面版 Codex(ChatGPT.app)一键走 API 中转站。面向小白用户:装好 → 选供应商 → 点一下,桌面版 Codex 立即开始走你的中转;官方登录、插件、订阅全部照常保留。
 
-## Features
+> ⚠️ **专有许可**:本仓库代码**仅供公开查看与学习**。未经授权禁止复制、修改、分发、商用或二次开发。详见 [LICENSE](./LICENSE)。
 
-- **Multi-Provider Support**: Unified interface for OpenAI, Anthropic, Azure OpenAI, and more
-- **Intelligent Rate Limiting**: Per-user and global rate limiting with configurable quotas
-- **Smart Caching**: Response caching to reduce API costs and improve latency
-- **Flexible Routing**: Route requests to different providers based on model, cost, or availability
-- **RESTful API**: OpenAI-compatible API for easy integration
-- **Web Dashboard**: Built-in management console for monitoring and configuration
-- **Docker Ready**: One-click deployment with Docker Compose
-- **Intelligent Routing**: Smart model selection based on task type and difficulty (requires local Ollama + qwen2.5:0.5b-instruct)
-## Quick Start
+---
 
-### Prerequisites
+## 它解决什么问题
 
-- Go 1.21 or higher
-- Redis (optional, for distributed caching)
-- Docker (optional, for containerized deployment)
+很多 Codex 用户想用 API 中转站(更便宜、模型更多),但官方 Codex 桌面版只认官方登录,配置中转需要手改 `~/.codex/config.toml` 和 `auth.json`——对普通用户几乎是劝退门槛。
 
-### Local Development
+2xapi Codex Console 把这个过程收敛成**一次点击**:
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/wenkezhi8/ai-gateway.git
-   cd ai-gateway
-   ```
+| 能力 | 说明 |
+|---|---|
+| 桌面版一键走中转 | 托管开启后,桌面版 Codex 的模型请求经本地网关转发到所选供应商,官方登录/插件/订阅原样保留 |
+| 账号自动识别 | 有官方账号 → 混入模式(登录保留);没账号 → 纯 API 模式,自动备份、可一键还原 |
+| 协议转换 | 只支持 Chat Completions 的中转站,经网关自动转成 Codex 的 Responses 协议,照样能用 |
+| 会话统一 | 对话记录保存在 `~/.codex`,官方与中转聊的都在同一个历史列表,随时继续 |
+| 加速线路(规划中) | 自有加速节点,2xapi 中转站流量自动走专线,可选开关 |
+| 极简 UI | 没有"供应商""模式"这类黑话,只有选谁、点一下 |
 
-2. Install dependencies:
-   ```bash
-   make deps
-   ```
+## 快速开始
 
-3. Copy the example configuration:
-   ```bash
-   cp configs/config.example.json configs/config.json
-   ```
+1. 下载安装包(见 [GitHub Releases](https://github.com/2xapi/ai-gateway/releases/latest))。
+2. 打开软件 → 登录 2xapi 账号(或手动填一个中转站地址 + Key)。
+3. 选好供应商 → 点「开启:桌面版走中转」。
+4. 打开桌面版 Codex,开始使用。
 
-4. Edit `configs/config.json` and add your API keys
+不需要修改任何配置文件;随时可一键还原官方配置。
 
-5. Run the application:
-   ```bash
-   make run
-   ```
-
-### Docker Deployment
-
-1. Build and run with Docker Compose:
-   ```bash
-   make docker-build
-   make docker-up
-   ```
-
-2. Access the gateway at `http://localhost:8566`
-
-## Configuration
-
-Configuration is managed via `configs/config.json`. Environment variables can override file settings.
-
-### Edition Management
-
-The dashboard supports 3 editions: `basic`, `standard`, and `enterprise`.
-
-- Switch path: `Settings -> 版本管理`
-- Local example config default: `standard`
-- Production template default: `basic`
-- Basic edition does not require Redis by default
-- Redis Stack is required when `vector_cache.enabled=true`
-- Guide: `docs/EDITION-GUIDE.md`
-- `Ollama 管理` 页面：标准版与企业版可见（侧边栏菜单）
-- `向量管理` / `知识库` 入口：仅企业版可见（Header 入口）
-
-Related admin APIs:
-
-- `GET /api/admin/edition`
-- `PUT /api/admin/edition`
-- `GET /api/admin/edition/definitions`
-- `GET /api/admin/edition/dependencies`
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CONFIG_PATH` | Path to config file (default: `./configs/config.json`) |
-| `SERVER_PORT` | Server port (default: `8566`) |
-| `GIN_MODE` | Gin mode: `debug` or `release` |
-| `CORS_ALLOW_ORIGINS` | CORS allowlist, comma-separated origins (default: `*`) |
-| `REDIS_HOST` | Redis host |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-
-## API Endpoints
-
-### Chat Completions
-```
-POST /api/v1/chat/completions
-```
-
-### Completions
-```
-POST /api/v1/completions
-```
-
-### Embeddings
-```
-POST /api/v1/embeddings
-```
-
-### List Providers
-```
-GET /api/v1/providers
-```
-
-### Health Check
-```
-GET /health
-```
-
-## Project Structure
-
-```
-ai-gateway/
-├── cmd/
-│   └── gateway/          # Application entry point
-│       └── main.go
-├── internal/
-│   ├── config/           # Configuration management
-│   ├── handler/          # HTTP handlers
-│   ├── middleware/       # HTTP middleware
-│   ├── router/           # Router setup
-│   ├── provider/         # AI provider adapters
-│   ├── limiter/          # Rate limiting
-│   └── cache/            # Response caching
-├── pkg/                  # Public packages
-├── configs/              # Configuration files
-├── scripts/              # Utility scripts
-├── web/                  # Web dashboard
-├── docker-compose.yml
-├── Dockerfile
-├── Makefile
-└── README.md
-```
-
-## Development
-
-### Running Tests
+## 开发
 
 ```bash
-make test
+cd src-tauri
+cargo test        # 单元测试
+cargo build --release
 ```
 
-### Code Formatting
+技术栈:Tauri 2 + Rust(axum 本地网关)+ 原生 JS 前端。
 
-```bash
-make fmt
-```
+## 在线更新
 
-### Linting
+应用从本仓库的 GitHub Releases 读取签名的 latest.json，检查、下载和安装由 Tauri updater 完成；更新包使用 minisign 签名校验，安装后自动重启。1.0.11 是启用在线更新的引导版本，旧版本需要先手动安装一次。
 
-```bash
-make lint
-```
+发布版本时保持 src-tauri/Cargo.toml、src-tauri/tauri.conf.json 与 Git tag 版本一致，并配置以下 GitHub Actions Secrets：
 
-## License
+- TAURI_SIGNING_PRIVATE_KEY
+- TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 
-MIT License
+更新签名私钥不得提交到仓库。普通安装包和 updater 专用包由 [.github/workflows/build-all.yml](./.github/workflows/build-all.yml) 统一发布。
+
+## 许可证
+
+**专有许可 / Proprietary License** — Copyright (C) 2026 2xapi. All rights reserved.
+
+本仓库代码仅供公开查看与学习。任何复制、修改、分发、商业使用或二次开发均须事先获得 2xapi 书面授权。查看 [LICENSE](./LICENSE) 获取完整条款。
+
+商业合作与授权请联系 2xapi。
