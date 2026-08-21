@@ -25,11 +25,6 @@
         ],
         "macOS": {
             "infoPlist": "Info.plist"
-        },
-        "windows": {
-            "targets": [
-                "nsis"
-            ]
         }
     },
     "plugins": {
