@@ -117,21 +117,13 @@ jobs:
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $root = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          # 显式匹配,避免在 .exe.sig 与 .nsis.zip.sig 之间取到不确定的文件
-          $zipSig = Get-ChildItem "$root/nsis" -Filter "*.nsis.zip.sig" | Select-Object -First 1
-          if ($zipSig) {
-            $zipUpdater = $zipSig.FullName.Substring(0, $zipSig.FullName.Length - 4)
-            $name = "2xapi-codex-console_${version}_windows_x86_64.nsis.zip"
-            Copy-Item $zipUpdater "release-assets/$name"
-            Copy-Item $zipSig.FullName "release-assets/$name.sig"
-          }
+          # 只发布 standalone EXE 安装器(不做增量 zip 与 MSI,减少发布面)
           $exeSig = Get-ChildItem "$root/nsis" -Filter "*.exe.sig" | Select-Object -First 1
-          if (-not $exeSig) { throw "Windows standalone installer signature not found" }
+          if (-not $exeSig) { throw "Windows installer signature not found" }
           $exeUpdater = $exeSig.FullName.Substring(0, $exeSig.FullName.Length - 4)
           $name = "2xapi-codex-console_${version}_windows_x86_64.exe"
           Copy-Item $exeUpdater "release-assets/$name"
           Copy-Item $exeSig.FullName "release-assets/$name.sig"
-          Get-ChildItem "$root/msi" -Filter "*.msi" | Select-Object -First 1 | Copy-Item -Destination "release-assets/2xapi-codex-console_${version}_windows_x86_64.msi"
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-x86_64
@@ -158,7 +150,7 @@ jobs:
           base_url="https://github.com/$REPO/releases/download/$TAG"
           mac_arm_sig=$(find release-assets -name '*_macos_aarch64.app.tar.gz.sig' -print -quit)
           mac_x64_sig=$(find release-assets -name '*_macos_x86_64.app.tar.gz.sig' -print -quit)
-          win_sig=$(find release-assets -name '*_windows_x86_64.nsis.zip.sig' -print -quit)
+          win_sig=$(find release-assets -name '*_windows_x86_64.exe.sig' -print -quit)
           test -n "$mac_arm_sig" && test -n "$mac_x64_sig" && test -n "$win_sig"
           jq -n \
             --arg version "$version" \
