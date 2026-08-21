@@ -11,7 +11,7 @@
 <body>
 <div id="app">
   <header class="topbar">
-    <span class="brand-logo"><img src="brand-logo.svg" alt="2xapi"></span><span class="brand">2xapi Console</span>
+    <span class="brand-logo"><img src="brand-logo.svg" alt="2xapi"></span><span class="brand">2xapi Console</span><span class="app-version-badge" id="appVersionBadge">v1.0.13</span>
     <span class="spacer"></span>
     <span class="chip" id="gwChip"><span class="led"></span>gateway 127.0.0.1:8787</span>
     <span class="chip"><b id="hostChip">未托管</b></span>
@@ -36,6 +36,7 @@
       <div class="nav-foot">
         <button class="nav-btn" id="nv-plug" style="--ac:var(--c-plug)" data-a="view" data-v="plug"><span>🧩</span><span class="tip">插件与能力市场</span></button>
         <button class="nav-btn" id="nv-eco" style="--ac:var(--c-gw)" data-a="view" data-v="eco"><span>🌱</span><span class="tip">生态中心(MCP 管理)</span></button>
+        <button class="nav-btn" id="nv-usage" style="--ac:var(--c-gw)" data-a="view" data-v="usage"><span>▥</span><span class="tip">使用统计</span></button>
         <button class="nav-btn" id="nv-history" style="--ac:var(--c-gw)" data-a="view" data-v="history"><span>🕘</span><span class="tip">历史会话</span></button>
         <button class="nav-btn" id="nv-settings" style="--ac:var(--c-gw)" data-a="settings-open"><span>⚙</span><span class="tip">设置(IP 管理 · 账号 · 通用…)</span></button>
       </div>
@@ -105,21 +106,13 @@
   </div>
 </div>
 
-<!-- ⚙ 设置弹窗:统一管理中心(六分区) -->
-<div class="mask" id="setMask" style="display:none" data-a="settings-close">
-  <div class="box" style="width:680px;max-height:80vh;display:grid;grid-template-columns:132px minmax(0,1fr);padding:0;overflow:hidden">
-    <aside id="setTabs" style="border-right:1px solid var(--hair);padding:12px 6px;display:flex;flex-direction:column;gap:2px"></aside>
-    <div class="box-body no-bar" id="setBody" style="padding:14px 16px"></div>
-  </div>
-</div>
-
 <!-- 一键导入 Key 向导(登录后自动弹 / 头像菜单进入) -->
 <div class="mask" id="impMask" style="display:none" data-a="imp-close">
   <div class="box" style="width:460px">
     <h3 style="margin:0 0 4px">⇭ 一键导入 Key</h3>
     <div class="sub">勾选要导入的 Key,自动拉取模型、生成供应商,无需手动填写。</div>
     <div class="box-body no-bar" id="impBody"></div>
-    <div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="imp-do">导入选中</button><button class="btn ghost" data-a="imp-close">取消</button></div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn primary" id="impSubmit" data-a="imp-do">导入选中</button><button class="btn ghost" id="impCancel" data-a="imp-close">取消</button></div>
   </div>
 </div>
 
@@ -129,11 +122,13 @@
     <h3 style="margin:0 0 4px">登录 2xapi 账号</h3>
     <div class="sub">登录后可一键导入你的 Key,自动生成供应商。</div>
     <div id="loginForm"></div>
-    <div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="do-login">登录</button><button class="btn ghost" data-a="login-close">取消</button></div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn primary" id="loginSubmit" data-a="do-login">登录</button><button class="btn ghost" id="loginCancel" data-a="login-close">取消</button></div>
   </div>
 </div>
 
 <div id="toastRoot"></div>
+<!-- 用量悬浮窗：默认由设置控制隐藏，桌面原生独立窗口接入前先提供同样的信息结构。 -->
+<aside id="usageOverlay" class="usage-overlay" style="display:none" aria-label="今日用量悬浮窗"></aside>
 <div class="confirm-mask" id="confirmMask" style="display:none">
   <div class="confirm-box">
     <div class="confirm-title" id="cfTitle"></div>

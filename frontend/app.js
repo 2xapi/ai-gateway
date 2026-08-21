@@ -6,7 +6,7 @@
 
 var state = {
   agent: "codex",      // codex | claude
-  view: "dash",        // dash | history
+  view: "dash",        // dash | usage | history | settings
   selId: null,         // 当前选中供应商
   providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
   activeProviderIds: {}, // GET /api/providers.active_provider_ids(按平台隔离)
@@ -22,6 +22,23 @@ var state = {
   menuOpen: false,     // 账号菜单展开
   search: "",          // 供应商栏筛选
   setTab: "ip",        // 设置五分区
+  usageOverlay: { enabled: false, opacity: 88, alwaysOnTop: true, clickThrough: false, opaqueOnHover: true, refreshInterval: 60 },
+  usageOverlayLoaded: false,
+  usageOverlayLoading: false,
+  usageOverlaySaving: false,
+  usageOverlayRequestSeq: 0,
+  usageOverlaySummary: null,
+  usageOverlayError: "",
+  usageOverlayRefreshing: false,
+  usageOverlayCompact: false,
+  usageOverlayTimer: null,
+  usageSummary: null,
+  usageHistory: null,
+  usageModels: null,
+  usageModelsHistory: null,
+  usageDays: 30,
+  usageProviderId: "",
+  usageAnalyticsError: "",
   sessions: null,      // 当前页 GET /api/sessions items
   sessionsTotal: 0,
   sessionsPage: 1,
@@ -53,12 +70,19 @@ var state = {
   nodeTest: null,      // {busy} | {ok,latencyMs} | {err,msg}
   importKeys: null,    // {keys, baseUrl}
   importBusy: false,
+  importOpening: false,
+  importRequestSeq: 0,
+  importProgress: "",
+  importError: "",
+  providersRequestSeq: 0,
+  sessionRequestSeq: 0,
   edit: null,          // 编辑草稿 {id,isNew,name,baseUrl,apiKey,model,wireApi,models}
   fieldErrors: {},
   test: null,          // 测试连接结果
   diag: null,          // 诊断结果 {forId, data}
   busy: null,          // 进行中动作
-  loginEmail: "", loginPassword: "", loginError: "", remembered: false,
+  loginEmail: "", loginPassword: "", loginError: "", loginBusy: false, loginPhase: "idle", loginTimer: null,
+  loginRequestSeq: 0, loginRememberChoice: true, loginFormDirty: false, remembered: false,
   balShow: true,       // 顶栏实时余额开关(localStorage 持久)
   aboutVersion: null,  // null=未请求;""=请求失败;其他=真实构建版本
   checkingUpdate: false,
@@ -71,8 +95,8 @@ var state = {
 
 var $ = function (s) { return document.querySelector(s); };
 function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  return String(s == null ? "" : s).replace(/[&<>"';]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", ";": "&#59;" }[c];
   });
 }
 var CHIP_COLORS = ["var(--c-gw)", "var(--c-direct)", "var(--c-accel)", "var(--c-official)"];
@@ -198,7 +222,9 @@ function normProviders(d) {
   return arr.filter(function (p) { return p && p.accessMode !== "official"; });
 }
 async function refreshProviders() {
+  var requestSeq = ++state.providersRequestSeq;
   var d = await api.listProviders();
+  if (requestSeq !== state.providersRequestSeq) return;
   state.providers = normProviders(d);
   state.activeProviderIds = (d && d.active_provider_ids) || {};
   var mine = providersFor(state.agent);
@@ -236,15 +262,27 @@ async function refreshAccel() {
   }
 }
 async function refreshSession() {
-  try { state.session = await api.session(); } catch (e) { state.session = null; }
-  state.balance = null;
-  if (loggedIn()) {
-    try {
-      var me = await api.me();
-      var u = (me && me.user) || me || {}; // 兼容 {user:{balance}} 与顶层 {balance}
-      if (typeof u.balance === "number") state.balance = u.balance;
-    } catch (e) { /* 下次刷新再试 */ }
-  }
+  var requestSeq = ++state.sessionRequestSeq;
+  var session = null;
+  try { session = await api.session(); } catch (e) { session = null; }
+  if (requestSeq !== state.sessionRequestSeq) return;
+  state.session = session;
+  var user = state.session && ((state.session.user && state.session.user) || state.session);
+  state.balance = user && typeof user.balance === "number" ? user.balance : null;
+  if (loggedIn()) refreshBalance(requestSeq);
+}
+async function refreshBalance(sessionRequestSeq) {
+  var requestSeq = sessionRequestSeq == null ? state.sessionRequestSeq : sessionRequestSeq;
+  var email = sessionEmail();
+  if (!email) return;
+  try {
+    var me = await api.me();
+    var user = (me && me.user) || me || {};
+    if (requestSeq === state.sessionRequestSeq && sessionEmail() === email && typeof user.balance === "number") {
+      state.balance = user.balance;
+      renderTopAuth();
+    }
+  } catch (e) { /* 保留 session 快照余额 */ }
 }
 async function refreshAll() {
   await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState()]);
@@ -252,7 +290,7 @@ async function refreshAll() {
 
 /* ── 渲染 ── */
 function renderNav() {
-  var noRail = state.view === "history" || state.view === "eco" || state.view === "plug";
+  var noRail = state.view === "usage" || state.view === "history" || state.view === "eco" || state.view === "plug" || state.view === "settings";
   document.getElementById("frame").classList.toggle("no-rail", noRail);
   document.querySelectorAll(".nav-btn.agent").forEach(function (b) {
     b.classList.toggle("on", b.dataset.g === state.agent);
@@ -263,6 +301,10 @@ function renderNav() {
   if (eb) eb.classList.toggle("on", state.view === "eco");
   var pb = document.getElementById("nv-plug");
   if (pb) pb.classList.toggle("on", state.view === "plug");
+  var ub = document.getElementById("nv-usage");
+  if (ub) ub.classList.toggle("on", state.view === "usage");
+  var sb = document.getElementById("nv-settings");
+  if (sb) sb.classList.toggle("on", state.view === "settings");
   /* 网关 chip:地址 + 存活灯 */
   var gw = (state.dstate && state.dstate.gateway) || null;
   var chip = document.getElementById("gwChip");
@@ -289,7 +331,7 @@ function renderNav() {
 }
 function renderRail() {
   var el = document.getElementById("railList"); if (!el) return;
-  var who = agentName(state.agent);
+  var who = esc(agentName(state.agent)); /* 供应商栏头部/空态拼 HTML,须转义(与 1876 行一致) */
   var mine = providersFor(state.agent);
   if (!mine.length) {
     el.innerHTML =
@@ -315,7 +357,7 @@ function railRowsHtml() {
   if (!list.length) return '<div class="sub" style="padding:8px 2px">没有匹配的供应商。</div>';
   return list.map(function (p) {
     var i = mine.indexOf(p);
-    return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
+    return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + esc(chipColor(p, i)) + '" data-a="sel" data-id="' + esc(p.id) + '">'
       + (function () {
           var pre = (window.PRESETS || []).find(function (x) { return x.id === (p.icon || "") });
           return pre
@@ -332,7 +374,13 @@ function renderRailRows() {
 }
 function renderContent() {
   var c = document.getElementById("content"); if (!c) return;
-  if (state.view === "history") c.innerHTML = historyHtml();
+  if (state.view === "settings") {
+    c.innerHTML = settingsPageHtml();
+    renderSettings();
+  } else if (state.view === "usage") {
+    c.innerHTML = usagePageHtml();
+    renderSettings();
+  } else if (state.view === "history") c.innerHTML = historyHtml();
   else if (state.view === "eco") c.innerHTML = ecoCenterHtml();
   else if (state.view === "plug") c.innerHTML = plugCenterHtml();
   else c.innerHTML = (state.agent === "claude") ? claudeDashHtml()
@@ -375,6 +423,19 @@ function renderTopAuth() {
       : '')
     + '</div>';
 }
+function renderAppVersion() {
+  var badge = document.getElementById("appVersionBadge");
+  if (badge && state.aboutVersion) badge.textContent = "v" + state.aboutVersion;
+}
+async function refreshAppVersion() {
+  try {
+    var result = await api.version();
+    state.aboutVersion = (result && result.version) || "";
+  } catch (error) {
+    state.aboutVersion = "";
+  }
+  renderAppVersion();
+}
 function render() {
   var mine = providersFor(state.agent);
   if (mine.length && !lineOf(state.selId)) {
@@ -382,9 +443,11 @@ function render() {
     state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : mine[0].id;
   }
   renderNav();
-  if (state.view !== "history") renderRail();
+  if (state.view !== "usage" && state.view !== "history" && state.view !== "eco" && state.view !== "plug" && state.view !== "settings") renderRail();
   renderContent();
   renderTopAuth();
+  renderAppVersion();
+  renderUsageOverlay();
   assertRouteShape();
 }
 /* 通路图形状自检:节点数 = 连线数 + 1 */
@@ -417,8 +480,8 @@ function dashHtml() {
   var way = codexWayNow();
   var direct = way === "direct";
 
-  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
-  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + esc(c) + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + esc(c) + '"></div>'; };
   var r, note;
   if (!hp) {
     r = st("var(--c-official)", "桌面版 Codex", "官方登录") + lk("var(--c-official)") + st("var(--c-official)", "官方 OpenAI", "chatgpt 登录");
@@ -558,8 +621,8 @@ function claudeDashHtml() {
   var accelOn = accelMode !== "off";
   var ac = "var(--c-claude)";
 
-  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
-  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + esc(c) + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + esc(c) + '"></div>'; };
   var way = "gateway";
   var direct = false;
   var r, note;
@@ -714,8 +777,8 @@ function genericDashHtml(agent) {
   var acc = state.accel || {};
   var accelOn = (acc.mode || "off") !== "off";
   var hp = hosted ? (lineOf(state.selId) || mine[0]) : null;
-  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
-  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + esc(c) + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + esc(c) + '"></div>'; };
   var r, note;
   if (!hosted) {
     r = st("var(--c-official)", meta.label, "官方/自有配置") + lk("var(--c-official)") + st("var(--c-official)", "直连", "未托管");
@@ -772,8 +835,8 @@ function hermesDashHtml() {
   var accelOn = (acc.mode || "off") !== "off";
   var hp = hosted ? (lineOf(state.selId) || mine[0]) : null;
 
-  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
-  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + esc(c) + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + esc(c) + '"></div>'; };
   var r, note;
   if (!hosted) {
     r = st("var(--c-official)", "Hermes CLI", "当前供应商:" + (esc(ptr) || "未设置")) + lk("var(--c-official)") + st("var(--c-official)", "官方/自有配置", "~/.hermes/config.yaml");
@@ -1470,6 +1533,17 @@ function plugCenterHtml() {
 function plug2MarketHtml() {
   var cats = ["all", "识图", "文生图", "图编辑", "抽帧", "语音"];
   var sourceTabs = [{ id: "all", name: "全部来源" }, { id: "official", name: "官方源" }].concat(PLUG2.mySources || []);
+  var html = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
+    + '<input data-a="plug2-search" placeholder="搜索插件(识图 / 生图 / 抽帧…)" value="' + esc(PLUG2.q) + '" style="flex:1;min-width:180px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:8px 12px;font-size:12px">'
+    + cats.map(function (c) { return '<button class="eco-tab ' + (PLUG2.cat === c ? "on" : "") + '" data-a="plug2-cat" data-v="' + c + '">' + (c === "all" ? "全部" : c) + '</button>'; }).join("")
+    + '</div>'
+    + (PLUG2.mode === "api" ? '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-3px 0 12px"><span class="sub" style="margin:0 3px 0 0">来源</span>'
+      + sourceTabs.map(function (src) { return '<button class="eco-tab ' + (PLUG2.source === src.id ? "on" : "") + '" data-a="plug2-source" data-v="' + esc(src.id) + '">' + esc(src.name || src.id) + '</button>'; }).join("") + '</div>' : '')
+    + '<div id="plug2MarketList">' + plug2MarketListHtml() + '</div>';
+  return html;
+}
+/* 市场列表段:搜索/分类/来源变化只重绘此容器,避免整页重建导致搜索框失焦(参考预设搜索 renderPresetGrid) */
+function plug2MarketListHtml() {
   /* 分类归一:后端 cap 用 ASR/TTS,前端分类叫「语音」——按映射表归一后过滤 */
   var CAT_OF = { "ASR": "语音", "TTS": "语音" };
   var list = PLUG2.data.filter(function (p) {
@@ -1478,12 +1552,7 @@ function plug2MarketHtml() {
     if (PLUG2.q && (p.name + p.desc + (p.tags || []).join(" ")).toLowerCase().indexOf(PLUG2.q.toLowerCase()) < 0) return false;
     return true;
   });
-  var html = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
-    + '<input data-a="plug2-search" placeholder="搜索插件(识图 / 生图 / 抽帧…)" value="' + esc(PLUG2.q) + '" style="flex:1;min-width:180px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:8px 12px;font-size:12px">'
-    + cats.map(function (c) { return '<button class="eco-tab ' + (PLUG2.cat === c ? "on" : "") + '" data-a="plug2-cat" data-v="' + c + '">' + (c === "all" ? "全部" : c) + '</button>'; }).join("")
-    + '</div>'
-    + (PLUG2.mode === "api" ? '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-3px 0 12px"><span class="sub" style="margin:0 3px 0 0">来源</span>'
-      + sourceTabs.map(function (src) { return '<button class="eco-tab ' + (PLUG2.source === src.id ? "on" : "") + '" data-a="plug2-source" data-v="' + esc(src.id) + '">' + esc(src.name || src.id) + '</button>'; }).join("") + '</div>' : '');
+  var html = "";
   var sourceErrors = (PLUG2.mySources || []).filter(function (src) { return !!src.error; });
   if (sourceErrors.length) {
     html += '<div style="margin-bottom:10px;padding:8px 10px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.35);border-radius:8px;font-size:11px;color:#FFBAB4">'
@@ -1966,8 +2035,11 @@ async function loadClaudeSessions(reset) {
 
 async function pollSessionsJob(id) {
   clearTimeout(state.sessionsRepairTimer);
+  /* 视图守卫:仅历史会话视图轮询/重绘;切走即停,避免 1s 全页渲染空转 */
+  if (state.view !== "history") return;
   try {
     var job = await api.sessionsJob(id);
+    if (state.view !== "history") return; /* 轮询期间切走 → 不再重绘/续排 */
     state.sessionsRepairJob = job;
     state.sessionsRepairing = job.status === "running";
     render();
@@ -1979,6 +2051,7 @@ async function pollSessionsJob(id) {
       await loadCodexHistory(1);
     }
   } catch (e) {
+    if (state.view !== "history") return;
     state.sessionsRepairing = false;
     state.sessionsRepairJob = { status: "failed", percent: 0, error: e.message || "读取修复进度失败" };
     render();
@@ -2443,103 +2516,234 @@ async function doAccel(m) {
 }
 
 /* ── 登录(2xapi 账号:邮箱/密码 + 记住我;站点开启验证码时弹滑块)── */
-var captchaCfg = { enabled: false, appId: "", loaded: false };
+var captchaCfg = { enabled: false, appId: "", loaded: false, loading: false, waiters: [] };
 function loadTcaptchaJs(cb) {
-  if (window.TencentCaptcha || captchaCfg.loaded) return cb();
-  captchaCfg.loaded = true;
+  cb = typeof cb === "function" ? cb : function () {};
+  if (window.TencentCaptcha) { captchaCfg.loaded = true; cb(); return; }
+  captchaCfg.waiters.push(cb);
+  if (captchaCfg.loading) return;
+  captchaCfg.loading = true;
   var s = document.createElement("script");
   s.src = "https://turing.captcha.qcloud.com/TCaptcha.js";
-  s.onload = function () { cb(); };
-  s.onerror = function () { captchaCfg.loaded = false; state.loginError = "验证码组件加载失败,请检查网络"; renderLoginForm(); };
+  s.onload = function () {
+    captchaCfg.loaded = !!window.TencentCaptcha;
+    captchaCfg.loading = false;
+    var waiters = captchaCfg.waiters.splice(0);
+    waiters.forEach(function (waiter) { waiter(captchaCfg.loaded ? null : new Error("验证码组件未就绪,请重试")); });
+  };
+  s.onerror = function () {
+    captchaCfg.loaded = false;
+    captchaCfg.loading = false;
+    var error = new Error("验证码组件加载失败,请检查网络");
+    var waiters = captchaCfg.waiters.splice(0);
+    waiters.forEach(function (waiter) { waiter(error); });
+  };
   document.head.appendChild(s);
 }
 function renderLoginForm() {
   var f = document.getElementById("loginForm"); if (!f) return;
+  var waitingCaptcha = state.loginPhase === "captcha";
+  var slowLogin = state.loginPhase === "slow";
+  var loginStatus = waitingCaptcha ? "请完成滑块验证…"
+    : (slowLogin ? "服务器响应较慢，请耐心等待…" : (state.loginBusy ? "正在登录…" : ""));
   f.innerHTML =
-    '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail) + '"></div>'
-    + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword) + '"></div>'
+    '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail) + '"' + (state.loginBusy ? " disabled" : "") + '></div>'
+    + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword) + '"' + (state.loginBusy ? " disabled" : "") + '></div>'
     + (captchaCfg.enabled ? '<div class="sub" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
-    + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember" checked>记住我(保持登录,滑块只需这一次)</label>'
+    + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember"' + (state.loginRememberChoice ? " checked" : "") + (state.loginBusy ? " disabled" : "") + '>记住我(保持登录,滑块只需这一次)</label>'
+    + (loginStatus ? '<div class="login-status" role="status" aria-live="polite"><span class="login-spinner" aria-hidden="true"></span>' + loginStatus + '</div>' : "")
     + (state.loginError ? '<div style="color:var(--c-err);font-size:12px;margin:0 0 4px">' + esc(state.loginError) + '</div>' : "");
+  var submit = document.getElementById("loginSubmit");
+  var cancel = document.getElementById("loginCancel");
+  if (submit) {
+    submit.disabled = state.loginBusy;
+    submit.textContent = waitingCaptcha ? "验证中…" : (state.loginBusy ? "登录中…" : "登录");
+  }
+  if (cancel) cancel.disabled = state.loginPhase === "submitting" || state.loginPhase === "slow";
+}
+function clearLoginTimer() {
+  if (state.loginTimer) clearTimeout(state.loginTimer);
+  state.loginTimer = null;
+}
+function beginLoginRequest() {
+  state.loginBusy = true;
+  state.loginPhase = "submitting";
+  clearLoginTimer();
+  state.loginTimer = setTimeout(function () {
+    if (state.loginBusy && state.loginPhase === "submitting") {
+      state.loginPhase = "slow";
+      renderLoginForm();
+    }
+  }, 2500);
 }
 function openLogin() {
+  var loginSeq = ++state.loginRequestSeq;
   state.loginError = "";
+  state.loginBusy = false;
+  state.loginPhase = "idle";
+  state.loginRememberChoice = true;
+  state.loginFormDirty = false;
+  clearLoginTimer();
   document.getElementById("loginMask").style.display = "";
   renderLoginForm();
   api.remembered().then(function (r) {
+    if (loginSeq !== state.loginRequestSeq || state.loginFormDirty || state.loginBusy) return;
     if (r && r.remembered) {
       state.loginEmail = r.email || "";
       state.loginPassword = r.password || "";
       state.remembered = true;
+      state.loginRememberChoice = true;
       renderLoginForm();
     }
   }).catch(function () {});
   api.captchaSettings().then(function (c) {
+    if (loginSeq !== state.loginRequestSeq) return;
     captchaCfg.enabled = !!(c && c.enabled);
     captchaCfg.appId = (c && String(c.appId || "")) || "";
-    if (captchaCfg.enabled) { loadTcaptchaJs(function () {}); renderLoginForm(); }
+    if (captchaCfg.enabled && state.loginPhase === "idle") { loadTcaptchaJs(function () {}); renderLoginForm(); }
   }).catch(function () {});
 }
 async function doLogin() {
-  var email = $('#loginForm [data-l="email"]').value.trim();
-  var password = $('#loginForm [data-l="password"]').value;
+  if (state.loginBusy) return;
+  var loginSeq = state.loginRequestSeq;
+  var emailField = $('#loginForm [data-l="email"]');
+  var passwordField = $('#loginForm [data-l="password"]');
+  if (!emailField || !passwordField) return;
+  var email = emailField.value.trim();
+  var password = passwordField.value;
   if (!email || !password) { state.loginError = "邮箱和密码都要填"; renderLoginForm(); return; }
   var remember = ($('#loginForm [data-l="remember"]') || {}).checked !== false;
+  state.loginRememberChoice = remember;
   var submit = async function (ticket, randstr) {
+    if (loginSeq !== state.loginRequestSeq) return;
+    if (state.loginBusy && state.loginPhase !== "captcha") return;
+    beginLoginRequest();
+    renderLoginForm();
     try {
-      await api.login(email, password, ticket, randstr, remember);
-      try { remember ? await api.remember(email, password) : await api.forget(); } catch (e) { /* 记住失败不影响登录 */ }
+      var session = await api.login(email, password, ticket, randstr, remember);
+      if (loginSeq !== state.loginRequestSeq) return;
+      state.sessionRequestSeq++;
+      state.session = session;
+      var user = (session && (session.user || session.data || session)) || {};
+      state.balance = typeof user.balance === "number" ? user.balance : null;
+      state.remembered = remember;
+      state.loginBusy = false;
+      state.loginPhase = "idle";
+      clearLoginTimer();
       document.getElementById("loginMask").style.display = "none";
       state.loginError = "";
-      await refreshSession();
+      (remember ? api.remember(email, password) : api.forget()).catch(function () {});
+      refreshBalance();
       showToast("登录成功" + (remember ? "(已记住,下次自动保持)" : ""), "ok");
-      if (!state.providers.length) openImport(); // 行业惯例:登录成功且无供应商 → 自动弹导入向导
       render();
+      if (!providersFor(state.agent).length) openImport();
     } catch (e) {
-      state.loginError = e.message; renderLoginForm();
+      if (loginSeq !== state.loginRequestSeq) return;
+      state.loginBusy = false;
+      state.loginPhase = "idle";
+      clearLoginTimer();
+      state.loginError = e.message;
+      renderLoginForm();
     }
   };
   if (captchaCfg.enabled && captchaCfg.appId) {
+    state.loginBusy = true;
+    state.loginPhase = "captcha";
+    renderLoginForm();
     loadTcaptchaJs(function () {
-      if (!window.TencentCaptcha) { state.loginError = "验证码组件未就绪,请重试"; renderLoginForm(); return; }
-      var cap = new window.TencentCaptcha(captchaCfg.appId, function (res) {
-        if (res && res.ret === 0) submit(res.ticket, res.randstr);
-      });
-      cap.show();
+      if (loginSeq !== state.loginRequestSeq) return;
+      if (arguments[0]) {
+        state.loginBusy = false;
+        state.loginPhase = "idle";
+        state.loginError = arguments[0].message;
+        renderLoginForm();
+        return;
+      }
+      if (!window.TencentCaptcha) {
+        state.loginBusy = false;
+        state.loginPhase = "idle";
+        state.loginError = "验证码组件未就绪,请重试";
+        renderLoginForm();
+        return;
+      }
+      try {
+        var cap = new window.TencentCaptcha(captchaCfg.appId, function (res) {
+          if (loginSeq !== state.loginRequestSeq) return;
+          if (res && res.ret === 0) submit(res.ticket, res.randstr);
+          else {
+            state.loginBusy = false;
+            state.loginPhase = "idle";
+            renderLoginForm();
+          }
+        });
+        cap.show();
+      } catch (error) {
+        if (loginSeq !== state.loginRequestSeq) return;
+        state.loginBusy = false;
+        state.loginPhase = "idle";
+        state.loginError = error.message || "验证码组件启动失败,请重试";
+        renderLoginForm();
+      }
     });
   } else {
     submit("", "");
   }
 }
 async function doLogout() {
+  state.sessionRequestSeq++;
   try { await api.logout(); } catch (e) {}
   try { await api.forget(); } catch (e) {}
-  state.session = null; state.balance = null; state.menuOpen = false;
+  state.session = null; state.balance = null; state.remembered = false; state.menuOpen = false;
   render();
   showToast("已登出", "ok");
 }
 
 /* ── 一键导入 Key 向导 ── */
-async function openImport() {
+function openImport() {
+  if (state.importOpening || state.importBusy) return;
   state.menuOpen = false; renderTopAuth();
+  state.importKeys = null;
+  state.importBusy = false;
+  state.importOpening = true;
+  state.importProgress = "";
+  state.importError = "";
+  document.getElementById("impMask").style.display = "";
+  renderImport();
+  loadImportKeys(++state.importRequestSeq);
+}
+async function loadImportKeys(requestSeq) {
   var keys = [], baseUrl = "";
   try {
     var d = await api.apiKeys();
+    if (requestSeq !== state.importRequestSeq) return;
     var raw = d || [];
-    keys = Array.isArray(raw) ? raw : ((raw && raw.keys) || []); // 后端契约 {keys,baseUrl};部分实现直接给数组
-    baseUrl = (!Array.isArray(raw) && raw && raw.baseUrl) || "";
+    var candidate = Array.isArray(raw) ? raw : (raw && (raw.keys || raw.items));
+    keys = Array.isArray(candidate) ? candidate : [];
+    baseUrl = (!Array.isArray(raw) && raw && (raw.baseUrl || raw.base_url)) || "";
   } catch (e) {
-    showToast("获取 Key 列表失败:" + e.message + (String(e.message).indexOf("登录") >= 0 ? ",请先登录" : ""), "error");
+    if (requestSeq !== state.importRequestSeq) return;
+    state.importError = (e && e.message) || "获取 Key 列表失败";
+    renderImport();
+    showToast("获取 Key 列表失败:" + state.importError + (state.importError.indexOf("登录") >= 0 ? ",请先登录" : ""), "error");
+    state.importOpening = false;
     return;
   }
+  if (requestSeq !== state.importRequestSeq) return;
   state.importKeys = { keys: keys, baseUrl: baseUrl };
-  state.importBusy = false;
-  document.getElementById("impMask").style.display = "";
+  state.importOpening = false;
   renderImport();
 }
 function renderImport() {
   var body = document.getElementById("impBody"); if (!body) return;
   var d = state.importKeys;
+  var submit = document.getElementById("impSubmit");
+  var cancel = document.getElementById("impCancel");
+  if (submit) { submit.disabled = state.importOpening || state.importBusy || !d; submit.textContent = state.importBusy ? "导入中…" : "导入选中"; }
+  if (cancel) cancel.disabled = state.importBusy;
+  if (state.importError) {
+    body.innerHTML = '<div style="color:var(--c-err)">获取 Key 列表失败：' + esc(state.importError) + '</div>';
+    return;
+  }
   if (!d) { body.innerHTML = '<div class="sub">正在获取你的 Key 列表…</div>'; return; }
   if (!d.keys.length) {
     body.innerHTML = '<div class="sub">账号里还没有 Key,去 2xapi 网站创建后再来导入。</div>';
@@ -2557,63 +2761,133 @@ function renderImport() {
       + '<span style="display:block;font-size:11px;color:var(--muted)">' + esc(masked) + quota + (active ? "" : ' · <span style="color:var(--c-err)">' + esc(k.status) + "</span>") + '</span></div>'
       + '<span class="tag">将生成供应商</span></div>';
   }).join("")
-    + (state.importBusy ? '<div class="sub" style="margin-top:6px">导入中…(逐 Key 拉模型、建供应商)</div>'
+    + (state.importBusy ? '<div class="sub" style="margin-top:6px">' + esc(state.importProgress || "正在准备导入…") + '</div>'
       : '<div class="sub" style="margin-top:6px">导入后自动拉取模型、填写默认模型,无需手动配置。</div>');
+}
+async function mapConcurrent(items, limit, task) {
+  var results = new Array(items.length);
+  var next = 0;
+  async function worker() {
+    while (next < items.length) {
+      var index = next++;
+      results[index] = await task(items[index], index);
+    }
+  }
+  var workers = [];
+  for (var i = 0; i < Math.min(limit, items.length); i++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
 }
 async function doImport() {
   var d = state.importKeys;
-  if (!d || !d.keys.length) return;
+  if (state.importBusy || !d || !d.keys.length) return;
   var selIdx = [];
   document.querySelectorAll('#impBody .imp-cb:checked').forEach(function (cb) { selIdx.push(Number(cb.dataset.i)); });
   if (!selIdx.length) { showToast("请先勾选要导入的 Key", "error"); return; }
-  state.importBusy = true; renderImport();
+  state.importBusy = true;
+  state.importProgress = "正在并行拉取模型（最多 3 个）…";
+  renderImport();
   var ok = 0, fail = [];
-  for (var n = 0; n < selIdx.length; n++) {
-    var k = d.keys[selIdx[n]];
-    if (!k) continue;
-    try {
-      var fm = await api.fetchModels({ baseUrl: d.baseUrl, apiKey: k.key });
-      var models = (fm.models || []).map(normModel);
-      if (!models.length) { fail.push((k.name || "Key") + ":拉不到模型"); continue; }
-      var name = (k.name && String(k.name).trim()) || ("2xapi-" + String(k.key || "").slice(-6));
-      if (state.providers.some(function (p) { return p.name === name; })) name += " 2";
-      await api.createProvider({
-        name: name, accessMode: "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
-        model: models[0].name, models: models,
-        reasoning_levels: Array.isArray(fm.reasoning_levels) ? fm.reasoning_levels : [],
-        agent: state.agent,
-      });
-      ok++;
-    } catch (e) { fail.push((k.name || "Key") + ":" + e.message); }
+  try {
+    var selected = selIdx.map(function (index) { return d.keys[index]; }).filter(Boolean);
+    var probed = await mapConcurrent(selected, 3, async function (key) {
+      try {
+        var fm = await api.fetchModels({ baseUrl: d.baseUrl, apiKey: key.key });
+        var models = Array.isArray(fm && fm.models) ? fm.models.map(normModel).filter(function (model) { return model.name; }) : [];
+        if (!models.length) return { key: key, error: "拉不到模型" };
+        return { key: key, models: models, levels: Array.isArray(fm.reasoning_levels || fm.reasoningLevels) ? (fm.reasoning_levels || fm.reasoningLevels) : [] };
+      } catch (e) { return { key: key, error: (e && e.message) || "拉模型失败" }; }
+    });
+    var usedNames = new Set(state.providers.map(function (provider) { return provider.name; }));
+    for (var n = 0; n < probed.length; n++) {
+      var item = probed[n];
+      var k = item.key;
+      if (item.error) { fail.push((k.name || "Key") + ":" + item.error); continue; }
+      state.importProgress = "正在保存供应商 " + (n + 1) + " / " + probed.length + "…";
+      renderImport();
+      try {
+        var name = (k.name && String(k.name).trim()) || ("2xapi-" + String(k.key || "").slice(-6));
+        var baseName = name;
+        var suffix = 2;
+        while (usedNames.has(name)) name = baseName + " " + suffix++;
+        await api.createProvider({
+          name: name, accessMode: "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
+          model: item.models[0].name, models: item.models,
+          reasoning_levels: item.levels,
+          agent: state.agent,
+        });
+        usedNames.add(name);
+        ok++;
+      } catch (e) { fail.push((k.name || "Key") + ":" + ((e && e.message) || "保存供应商失败")); }
+    }
+  } catch (e) {
+    fail.push("导入过程:" + ((e && e.message) || "未知错误"));
   }
-  await refreshProviders();
+  try { await refreshProviders(); } catch (e) { fail.push("刷新供应商列表:" + ((e && e.message) || "失败")); }
   document.getElementById("impMask").style.display = "none";
   state.importBusy = false;
-  showToast(ok ? ("已导入 " + ok + " 个供应商" + (fail.length ? "(" + fail.length + " 失败)" : "")) : ("导入失败:" + fail[0]), ok ? "ok" : "err");
+  state.importProgress = "";
+  showToast(ok ? ("已导入 " + ok + " 个供应商" + (fail.length ? "(" + fail.length + " 失败)" : "")) : ("导入失败:" + (fail[0] || "未知错误")), ok ? "ok" : "err");
   render();
 }
 
 /* ── ⚙ 设置弹窗:五分区 ── */
 var SET_TABS = [["ip", "IP 管理"], ["usage", "用量"], ["account", "账号"], ["general", "通用"], ["advanced", "高级"], ["about", "关于"]];
+function consumeUsageOverlayHiddenMarker() {
+  var hidden = false;
+  try {
+    hidden = localStorage.getItem("2xapi.usageOverlay.enabled") === "0";
+  } catch (e) {
+    return false;
+  }
+  if (!hidden) return false;
+  state.usageOverlay.enabled = false;
+  state.usageOverlayLoaded = false;
+  try { localStorage.removeItem("2xapi.usageOverlay.enabled"); } catch (e) { return true; }
+  return true;
+}
+function markUsageOverlayHidden() {
+  try { localStorage.setItem("2xapi.usageOverlay.enabled", "0"); } catch (e) { return false; }
+  return true;
+}
 function openSettings() {
+  consumeUsageOverlayHiddenMarker();
+  state.usageOverlayLoaded = false;
   state.setTab = "ip";
+  state.view = "settings";
   state.menuOpen = false;
-  renderSettings();
-  document.getElementById("setMask").style.display = "";
+  render();
+}
+function settingsPageHtml() {
+  return '<section class="settings-page">'
+    + '<header class="settings-page-head"><div><div class="eyebrow">WORKSPACE SETTINGS</div><h1>设置</h1><div class="sub">统一管理线路、账号、用量悬浮窗、通用行为和应用更新。</div></div>'
+    + '<button class="btn ghost" data-a="settings-back">← 返回工作区</button></header>'
+    + '<div class="settings-layout"><aside class="settings-nav" id="setTabs"></aside><div class="settings-body no-bar" id="setBody"></div></div>'
+    + '</section>';
+}
+function usagePageHtml() {
+  return '<section class="usage-page"><header class="settings-page-head"><div><div class="eyebrow">DATA &amp; STATISTICS</div><h1>使用统计</h1><div class="sub">查看第三方中转站当天 Token、历史趋势、模型用量和缓存命中率。</div></div><button class="btn ghost" data-a="settings-back">← 返回工作区</button></header><div id="usagePageBody" class="usage-page-body"></div></section>';
 }
 function renderSettings() {
-  var tabs = document.getElementById("setTabs"); if (!tabs) return;
-  tabs.innerHTML = SET_TABS.map(function (x) {
-    return '<button class="set-tab ' + (state.setTab === x[0] ? "on" : "") + '" data-a="set-tab" data-s="' + x[0] + '">' + x[1] + '</button>';
-  }).join("");
-  var body = document.getElementById("setBody"); if (!body) return;
-  body.innerHTML =
-    state.setTab === "ip" ? setIpHtml()
-    : state.setTab === "usage" ? setUsageHtml()
-    : state.setTab === "account" ? setAccountHtml()
-    : state.setTab === "general" ? setGeneralHtml()
-    : state.setTab === "advanced" ? setAdvancedHtml()
-    : setAboutHtml();
+  var tabs = document.getElementById("setTabs");
+  if (tabs) {
+    tabs.innerHTML = SET_TABS.map(function (x) {
+      return '<button class="set-tab ' + (state.setTab === x[0] ? "on" : "") + '" data-a="set-tab" data-s="' + x[0] + '">' + x[1] + '</button>';
+    }).join("");
+  }
+  var body = document.getElementById("setBody");
+  if (body) {
+    body.innerHTML =
+      state.setTab === "ip" ? setIpHtml()
+      : state.setTab === "usage" ? setUsageHtml()
+      : state.setTab === "account" ? setAccountHtml()
+      : state.setTab === "general" ? setGeneralHtml()
+      : state.setTab === "advanced" ? setAdvancedHtml()
+      : setAboutHtml();
+    return;
+  }
+  var usageBody = document.getElementById("usagePageBody");
+  if (usageBody) usageBody.innerHTML = setUsageHtml();
 }
 function setRow(label, ctrl, hint) {
   return '<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--hair)">'
@@ -2719,41 +2993,375 @@ async function doIpmRefresh() {
   } catch (e) { showToast(e.message, "error"); }
   state.busy = null; renderSettings();
 }
+function usageValue(value) {
+  return value == null ? "暂无数据" : fmtTokens(value);
+}
+function usageList(raw) {
+  var source = raw && (raw.data || raw) || {};
+  return Array.isArray(source) ? source : (Array.isArray(source.items) ? source.items : []);
+}
+function usageDateLabel(date) {
+  var text = String(date || "");
+  return text.length >= 10 ? text.slice(5) : text;
+}
+function usageSyncLabel(value) {
+  if (!value) return "尚未同步";
+  var date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "上次同步时间未知";
+  return "上次同步 " + date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function usageSummaryCard(summary) {
+  var value = summary || {};
+  return '<div class="usage-stats-metrics">'
+    + '<div><span>今日 Token</span><b>' + esc(usageValue(value.totalTokens)) + '</b></div>'
+    + '<div><span>输入</span><b>' + esc(usageValue(value.inputTokens)) + '</b></div>'
+    + '<div><span>输出</span><b>' + esc(usageValue(value.outputTokens)) + '</b></div>'
+    + '<div><span>请求</span><b>' + esc(value.requests == null ? "暂无数据" : String(value.requests)) + '</b></div>'
+    + '<div><span>缓存命中率</span><b>' + esc(cacheHitRateText(value.cacheHitRate)) + '</b></div>'
+    + '<div><span>今日费用</span><b>' + esc(value.cost == null ? "暂无数据" : String(value.cost)) + '</b></div>'
+    + '</div>';
+}
+function usageHistoryHtml(history) {
+  if (!history.length) return '<div class="usage-empty">所选时间内暂无 Token 数据</div>';
+  var totals = history.map(function (item) { return Number(item.totalTokens) || 0; });
+  var max = Math.max.apply(Math, totals.concat([1]));
+  return '<div class="usage-history-chart">' + history.map(function (item, index) {
+    var total = totals[index];
+    var height = total > 0 ? Math.max(8, Math.round(total * 100 / max)) : 3;
+    return '<div class="usage-history-col" title="' + esc((item.date || "") + " · " + usageValue(item.totalTokens)) + '"><div class="usage-history-bar" style="height:' + height + '%"></div><span>' + esc(usageDateLabel(item.date)) + '</span></div>';
+  }).join("") + '</div>';
+}
+function usageHeatmapHtml(history) {
+  var days = history.slice(-28);
+  if (!days.length) return '<div class="usage-empty">暂无 Token 活动数据</div>';
+  var totals = days.map(function (item) { return Number(item.totalTokens) || 0; });
+  var max = Math.max.apply(Math, totals.concat([1]));
+  var cells = days.map(function (item, index) {
+    var total = totals[index];
+    var level = total <= 0 ? 0 : 1 + Math.min(4, Math.floor(total * 5 / max));
+    return '<i class="cell l' + level + '" title="' + esc((item.date || "") + " · " + usageValue(item.totalTokens)) + '"></i>';
+  });
+  var rows = [];
+  for (var i = 0; i < cells.length; i += 7) rows.push('<div class="heat-row">' + cells.slice(i, i + 7).join("") + '</div>');
+  return '<div class="usage-heatmap"><div class="heat-head"><span>近 ' + days.length + ' 日 Token 活动</span><span class="heat-scale"><i class="cell l0"></i><i class="cell l1"></i><i class="cell l2"></i><i class="cell l3"></i><i class="cell l4"></i></span></div>' + rows.join("") + '</div>';
+}
+var USAGE_MODEL_COLORS = ["#2586e4", "#28a06d", "#9476e8", "#e65d68", "#8a93a2"];
+function usageModelTrendHtml(series, history) {
+  var dated = series.filter(function (item) { return item && item.points && item.points.length; });
+  if (!dated.length || !history || !history.length) return '<div class="usage-empty">暂无按模型拆分的数据</div>';
+  var byDate = {};
+  history.forEach(function (item) { byDate[item.date] = Number(item.totalTokens) || 0; });
+  var top = dated.slice(0, 4);
+  var rest = dated.slice(4);
+  var restName = "其他模型";
+  var lines = top.map(function (item) { return { name: item.model || "unknown", points: item.points }; });
+  if (rest.length) {
+    var merged = rest.reduce(function (acc, item) {
+      item.points.forEach(function (point, i) {
+        acc[i] = (acc[i] || 0) + (Number(point.totalTokens) || 0);
+      });
+      return acc;
+    }, []);
+    var dates = history.map(function (item) { return item.date; });
+    lines.push({ name: restName, points: dates.map(function (date, i) { return { date: date, totalTokens: merged[i] || 0 }; }) });
+  }
+  var allValues = [];
+  lines.forEach(function (line) { line.points.forEach(function (p) { allValues.push(Number(p.totalTokens) || 0); }); });
+  var max = Math.max.apply(Math, allValues.concat([1]));
+  var width = 640, height = 200, padL = 8, padR = 8, padT = 10, padB = 24;
+  var plotW = width - padL - padR, plotH = height - padT - padB;
+  var n = history.length;
+  var x = function (i) { return padL + (n <= 1 ? plotW / 2 : plotW * i / (n - 1)); };
+  var y = function (v) { return padT + plotH - Math.max(0, Math.min(1, v / max)) * plotH; };
+  var grid = [0, 0.25, 0.5, 0.75, 1].map(function (f) {
+    return '<line x1="' + padL + '" y1="' + (padT + plotH * f) + '" x2="' + (width - padR) + '" y2="' + (padT + plotH * f) + '" class="g"/>';
+  }).join("");
+  var polylines = lines.map(function (line, li) {
+    var pts = line.points.map(function (p, i) {
+      var value = Number(p.totalTokens) || 0;
+      return x(i).toFixed(1) + "," + y(value).toFixed(1);
+    }).join(" ");
+    var color = USAGE_MODEL_COLORS[li % USAGE_MODEL_COLORS.length];
+    return '<polyline points="' + pts + '" fill="none" stroke="' + color + '" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/>';
+  }).join("");
+  var labels = [];
+  var labelIdx = [0, Math.floor((n - 1) / 2), n - 1];
+  labelIdx.forEach(function (i) {
+    if (labels.indexOf(i) === -1 && i >= 0 && i < n) {
+      labels.push(i);
+      polylines += '<text x="' + x(i).toFixed(1) + '" y="' + (height - 6) + '" class="t" text-anchor="middle">' + esc(usageDateLabel(history[i].date)) + '</text>';
+    }
+  });
+  var legend = lines.map(function (line, li) {
+    return '<span class="legend"><i style="background:' + USAGE_MODEL_COLORS[li % USAGE_MODEL_COLORS.length] + '"></i>' + esc(line.name) + '</span>';
+  }).join("");
+  return '<div class="usage-model-trend"><div class="heat-head"><span>每日 Token 趋势 · 按模型拆分</span></div><div class="legend-row">' + legend + '</div><svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">' + grid + polylines + '</svg></div>';
+}
+function usageCacheSavingsHtml(summary) {
+  if (!summary) return '暂无缓存数据';
+  var total = Number(summary.totalTokens) || 0;
+  var cacheRead = Number(summary.cacheReadTokens) || 0;
+  var cost = summary.cost == null ? null : Number(summary.cost);
+  if (total <= 0 || cacheRead <= 0 || !Number.isFinite(cost)) return '命中 Token ' + esc(usageValue(summary.cacheReadTokens)) + ' · 输入 Token ' + esc(usageValue(summary.inputTokens)) + ' · 命中率 ' + esc(cacheHitRateText(summary.cacheHitRate));
+  var estimated = cacheRead * cost / total;
+  return '命中 Token ' + esc(usageValue(summary.cacheReadTokens)) + ' · 输入 Token ' + esc(usageValue(summary.inputTokens)) + ' · 命中率 ' + esc(cacheHitRateText(summary.cacheHitRate)) + ' · 预计节省 <b>$' + esc(estimated.toFixed(2)) + '</b><span class="usage-cache-note-tip">（按今日均价估算）</span>';
+}
+function usageModelsHtml(models) {
+  if (!models.length) return '<div class="usage-empty">暂无模型用量</div>';
+  return '<div class="usage-model-list">' + models.slice(0, 8).map(function (item) {
+    var share = item.share == null || item.share === "" ? null : Number(item.share);
+    var width = Number.isFinite(share) ? Math.max(2, Math.min(100, Math.round(share * 100))) : 2;
+    return '<div class="usage-model-row"><div class="usage-model-head"><b>' + esc(item.model || "unknown") + '</b><span>' + esc(usageValue(item.totalTokens)) + ' · ' + (Number.isFinite(share) ? Math.round(share * 100) + '%' : '暂无数据') + '</span></div><div class="usage-model-track"><i style="width:' + width + '%"></i></div><div class="usage-model-meta">输入 ' + esc(usageValue(item.inputTokens)) + ' · 输出 ' + esc(usageValue(item.outputTokens)) + ' · 命中率 ' + esc(cacheHitRateText(item.cacheHitRate)) + '</div></div>';
+  }).join("") + '</div>';
+}
+function usagePerformanceHtml(u) {
+  if (u && u.err) return '<div class="usage-empty" style="color:var(--c-err)">✗ ' + esc(u.err) + '</div>';
+  if (u && u.busy && (!u.providers || !u.providers.length)) return '<div class="usage-empty">正在同步统计…</div>';
+  var providers = (u && u.providers) || [];
+  if (!providers.length) return '<div class="usage-empty">暂无请求性能记录</div>';
+  return providers.map(function (p) {
+    var okRate = p.okRate == null ? "暂无数据" : Math.round(p.okRate * 100) + "%";
+    return '<div class="hist-row" style="align-items:flex-start"><b style="min-width:96px">' + esc(p.providerName || p.providerId) + '</b><span class="meta">' + p.count + ' 次请求</span><span class="tag">P50 ' + (p.p50Ms != null ? p.p50Ms + "ms" : "暂无数据") + '</span><span class="tag">P90 ' + (p.p90Ms != null ? p.p90Ms + "ms" : "暂无数据") + '</span><span class="tag">成功率 ' + okRate + '</span></div>';
+  }).join("");
+}
 function setUsageHtml() {
-  var u = state.usage;
-  var rows;
-  if (u && u.err) rows = '<div class="sub" style="color:var(--c-err);padding:4px 0">✗ ' + esc(u.err) + '</div>';
-  else if (u && u.busy) rows = '<div class="sub" style="padding:4px 0">加载中…</div>';
-  else if (u && u.providers && u.providers.length) {
-    rows = u.providers.map(function (p) {
-      var okRate = (p.okRate != null) ? Math.round(p.okRate * 100) + "%" : "—";
-      return '<div class="hist-row" style="align-items:flex-start">'
-        + '<b style="min-width:96px">' + esc(p.providerName || p.providerId) + '</b>'
-        + '<span class="meta">' + p.count + ' 次请求</span>'
-        + '<span class="tag">P50 ' + (p.p50Ms != null ? p.p50Ms + "ms" : "—") + '</span>'
-        + '<span class="tag">P90 ' + (p.p90Ms != null ? p.p90Ms + "ms" : "—") + '</span>'
-        + '<span class="tag">成功率 ' + okRate + '</span>'
-        + (p.lastTs ? '<span class="tag">' + fmtTime(p.lastTs * 1000) + '</span>' : '')
-        + (p.routes && p.routes.length ? '<div class="sub" style="width:100%;font-family:var(--mono);font-size:11px">' + esc(p.routes.join(" · ")) + '</div>' : '')
-        + '</div>';
-    }).join("");
-  } else rows = '<div class="sub" style="padding:4px 0">暂无请求记录。使用网关转发对话后,这里会自动按供应商积累 P50/P90 延迟与成功率基准。</div>';
-  return '<h3 style="margin:2px 0 4px;font-size:13.5px">用量仪表盘 · 网关统计</h3>'
-    + '<div class="sub" style="margin-bottom:6px">每次经网关的请求自动落台账(不记录密钥);P50/P90 随使用自然累积,可作各供应商的延迟基准。</div>'
-    + '<div style="margin:6px 0 10px"><button class="btn sm" data-a="usage-refresh"' + (u && u.busy ? " disabled" : "") + '>↻ 刷新</button></div>'
-    + rows;
+  var u = state.usage || {};
+  var summary = state.usageSummary;
+  var history = state.usageHistory || [];
+  var models = state.usageModels || [];
+  var modelsHistory = state.usageModelsHistory || [];
+  var providers = state.providers || [];
+  var providerOptions = '<option value="">全部第三方中转站</option>' + providers.map(function (p) {
+    return '<option value="' + esc(p.id) + '"' + (state.usageProviderId === p.id ? ' selected' : '') + '>' + esc(p.name || p.id) + '</option>';
+  }).join("");
+  var periods = [7, 30, 90].map(function (days) {
+    return '<button class="btn sm ' + (state.usageDays === days ? 'primary' : 'ghost') + '" data-a="usage-days" data-days="' + days + '">' + days + ' 日</button>';
+  }).join("");
+  var cache = usageCacheSavingsHtml(summary);
+  var syncMessage = u.err ? '<span class="usage-sync-error">同步失败，保留上次成功数据：' + esc(u.err) + '</span>' : '<span>' + esc(usageSyncLabel(u.syncedAt)) + '</span>';
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">第三方中转站用量统计</h3>'
+    + '<div class="sub" style="margin-bottom:8px">只统计经本地网关转发的第三方请求，缺少上游 usage 时保留为「暂无数据」。</div>'
+    + usageOverlaySettingsHtml()
+    + '<div class="usage-stats-toolbar"><select class="overlay-select" data-a="usage-provider">' + providerOptions + '</select><div class="usage-stats-toolbar-actions"><span class="usage-sync-label">' + syncMessage + '</span><div class="btn-row">' + periods + '<button class="btn sm ghost" data-a="usage-refresh"' + (u.busy ? ' disabled' : '') + '>' + (u.busy ? '同步中…' : '刷新') + '</button></div></div></div>'
+    + usageSummaryCard(summary)
+    + '<div class="usage-section"><div class="usage-section-title"><b>Token 活动</b><span>近 ' + state.usageDays + ' 日</span></div>' + usageHeatmapHtml(history) + '</div>'
+    + '<div class="usage-section"><div class="usage-section-title"><b>历史 Token 趋势</b><span>近 ' + state.usageDays + ' 日</span></div>' + usageHistoryHtml(history) + usageModelTrendHtml(modelsHistory, history) + '</div>'
+    + '<div class="usage-two-col"><div class="usage-section"><div class="usage-section-title"><b>模型用量排行</b><span>按 Token</span></div>' + usageModelsHtml(models) + '</div><div class="usage-section"><div class="usage-section-title"><b>缓存效率</b><span>今日</span></div><div class="usage-cache-value">' + esc(cacheHitRateText(summary && summary.cacheHitRate)) + '</div><div class="usage-cache-note">' + cache + '</div></div></div>'
+    + '<div class="usage-section"><div class="usage-section-title"><b>请求性能</b><span>P50/P90</span></div>' + usagePerformanceHtml(u) + '</div>';
+}
+function usageOverlayDefaults() {
+  return { enabled: false, opacity: 88, alwaysOnTop: true, clickThrough: false, opaqueOnHover: true, refreshInterval: 60 };
+}
+function normalizeUsageOverlaySettings(raw) {
+  var source = raw && (raw.settings || raw.data || raw) || {};
+  var opacity = Number(source.opacity);
+  if (Number.isFinite(opacity) && opacity <= 1) opacity *= 100;
+  var interval = Number(source.refreshInterval || source.refresh_interval || source.refreshIntervalSecs || source.refresh_interval_secs);
+  return {
+    enabled: source.enabled === true,
+    opacity: Number.isFinite(opacity) ? Math.max(60, Math.min(100, opacity)) : 88,
+    alwaysOnTop: source.alwaysOnTop !== false && source.always_on_top !== false,
+    clickThrough: source.clickThrough === true || source.click_through === true,
+    opaqueOnHover: source.opaqueOnHover !== false && source.opaque_on_hover !== false
+      && source.restoreFullOpacityOnHover !== false && source.restore_full_opacity_on_hover !== false,
+    refreshInterval: Number.isFinite(interval) ? Math.max(15, Math.min(300, interval)) : 60,
+  };
+}
+function normalizeUsageSummary(raw) {
+  var s = raw && (raw.summary || raw.data || raw) || {};
+  var nullable = function (value) {
+    if (value == null || value === "") return null;
+    var number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  var input = nullable(s.inputTokens != null ? s.inputTokens : s.input_tokens);
+  var output = nullable(s.outputTokens != null ? s.outputTokens : s.output_tokens);
+  var total = nullable(s.totalTokens != null ? s.totalTokens : s.total_tokens);
+  var requests = nullable(s.requests != null ? s.requests : (s.requestCount != null ? s.requestCount : s.request_count));
+  var cacheRead = nullable(s.cacheReadTokens != null ? s.cacheReadTokens : s.cache_read_tokens);
+  var cacheHitRate = nullable(s.cacheHitRate != null ? s.cacheHitRate : s.cache_hit_rate);
+  var cost = nullable(s.cost != null ? s.cost : s.totalCost);
+  return {
+    totalTokens: total != null ? total : (input != null && output != null ? input + output : null),
+    inputTokens: input,
+    outputTokens: output,
+    cacheReadTokens: cacheRead,
+    cacheHitRate: cacheHitRate,
+    requests: requests,
+    cost: cost,
+    updatedAt: s.updatedAt || s.updated_at || null,
+  };
+}
+function cacheHitRateText(value) {
+  if (value == null || value === "") return "暂无数据";
+  var number = Number(value);
+  if (!Number.isFinite(number)) return "暂无数据";
+  var rate = number <= 1 ? number * 100 : number;
+  return Math.max(0, rate).toFixed(1) + "%";
+}
+function fmtTokens(value) {
+  if (value == null || value === "") return "暂无数据";
+  var n = Number(value);
+  if (!Number.isFinite(n)) return "暂无数据";
+  if (Math.abs(n) >= 1000000000) return (n / 1000000000).toFixed(n >= 10000000000 ? 0 : 1) + "B";
+  if (Math.abs(n) >= 1000000) return (n / 1000000).toFixed(n >= 100000000 ? 0 : 1) + "M";
+  if (Math.abs(n) >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "K";
+  return String(Math.round(n));
+}
+function usageOverlaySummaryHtml(summary) {
+  if (!summary) return '<div class="usage-overlay-main"><div><strong>暂无数据</strong><span>今日 Token</span></div></div><div class="usage-overlay-meta">暂未获取到中转站用量</div>';
+  var rate = cacheHitRateText(summary.cacheHitRate);
+  return '<div class="usage-overlay-main"><div><strong>' + esc(fmtTokens(summary.totalTokens)) + '</strong><span>今日 Token</span></div><div class="usage-overlay-meta">缓存 ' + esc(rate) + '</div></div>'
+    + '<div class="usage-overlay-grid"><div><span>输入</span><b>' + esc(fmtTokens(summary.inputTokens)) + '</b></div><div><span>输出</span><b>' + esc(fmtTokens(summary.outputTokens)) + '</b></div><div><span>请求</span><b>' + esc(summary.requests == null ? "暂无数据" : String(summary.requests)) + '</b></div></div>';
+}
+function usageOverlaySettingsHtml() {
+  if (!state.usageOverlayLoaded) loadUsageOverlaySettings();
+  var s = state.usageOverlay || usageOverlayDefaults();
+  var locked = state.usageOverlayLoading || state.usageOverlaySaving;
+  var disabled = locked ? " disabled" : "";
+  var status = state.usageOverlayLoading ? "读取设置…" : (state.usageOverlaySaving ? "保存中…" : (state.usageOverlayError ? "保存失败" : "未修改"));
+  var visibilityAction = s.enabled ? "hide" : "show";
+  var visibilityLabel = s.enabled ? "隐藏悬浮窗" : "打开悬浮窗";
+  return '<section class="card usage-overlay-settings"><div class="usage-overlay-settings-head"><div><h2>Token 使用量悬浮窗</h2><div class="sub">默认关闭;打开后显示第三方中转站当天 Token、输入、输出、请求数和缓存命中率。</div></div><div class="usage-overlay-actions"><span class="tag ' + (s.enabled ? "on" : "") + '">' + (s.enabled ? "已开启" : "已关闭") + '</span><button class="btn ' + (s.enabled ? "ghost" : "primary") + '" data-a="usage-overlay-visibility" data-v="' + visibilityAction + '"' + disabled + '>' + visibilityLabel + '</button></div></div>'
+    + setRow('显示悬浮窗', '<span class="tag">' + (s.enabled ? "当前可见" : "当前隐藏") + '</span>', '点击上方按钮即可立即打开或隐藏,不需要离开当前页面。')
+    + setRow('透明度', '<div class="overlay-range"><input type="range" min="60" max="100" step="1" data-a="usage-overlay-opacity" value="' + s.opacity + '"' + disabled + '><output>' + s.opacity + '%</output></div>', '范围 60%–100%,默认 88%。')
+    + setRow('窗口行为', '<div class="overlay-checks"><label><input type="checkbox" data-a="usage-overlay-top"' + (s.alwaysOnTop ? " checked" : "") + disabled + '> 置顶</label><label><input type="checkbox" data-a="usage-overlay-click"' + (s.clickThrough ? " checked" : "") + disabled + '> 鼠标穿透</label><label><input type="checkbox" data-a="usage-overlay-hover"' + (s.opaqueOnHover ? " checked" : "") + disabled + '> 移入恢复不透明</label></div>', '按住悬浮窗顶部标题栏即可移动; 开启鼠标穿透后需先关闭穿透才能移动。')
+    + setRow('刷新间隔', '<select class="overlay-select" data-a="usage-overlay-interval"' + disabled + '><option value="15"' + (s.refreshInterval === 15 ? " selected" : "") + '>15 秒</option><option value="30"' + (s.refreshInterval === 30 ? " selected" : "") + '>30 秒</option><option value="60"' + (s.refreshInterval === 60 ? " selected" : "") + '>1 分钟</option><option value="300"' + (s.refreshInterval === 300 ? " selected" : "") + '>5 分钟</option></select>', '只在悬浮窗开启时刷新。')
+    + '<div class="btn-row" style="margin-top:12px"><button class="btn primary" data-a="usage-overlay-save"' + (locked ? " disabled" : "") + '>保存设置</button><span class="sub">' + status + '</span></div></section>';
+}
+function loadUsageOverlaySettings() {
+  if (state.usageOverlayLoaded || state.usageOverlayLoading) return;
+  state.usageOverlayLoaded = true;
+  state.usageOverlayLoading = true;
+  var requestSeq = ++state.usageOverlayRequestSeq;
+  api.usageOverlaySettings().then(function (raw) {
+    if (requestSeq !== state.usageOverlayRequestSeq) return;
+    state.usageOverlay = normalizeUsageOverlaySettings(raw);
+    state.usageOverlayError = "";
+    if (state.usageOverlay.enabled) refreshUsageSummary();
+  }).catch(function (e) {
+    if (requestSeq === state.usageOverlayRequestSeq) state.usageOverlayError = (e && e.message) || "设置读取失败";
+  }).finally(function () {
+    if (requestSeq !== state.usageOverlayRequestSeq) return;
+    state.usageOverlayLoading = false;
+    renderSettings();
+    renderUsageOverlay();
+  });
+}
+function refreshUsageSummary() {
+  if (state.usageOverlayRefreshing || !state.usageOverlay.enabled) return;
+  state.usageOverlayRefreshing = true;
+  api.usageSummary().then(function (raw) {
+    state.usageOverlaySummary = normalizeUsageSummary(raw);
+    state.usageOverlayError = "";
+  }).catch(function (e) { state.usageOverlayError = e.message || "用量读取失败"; })
+    .finally(function () { state.usageOverlayRefreshing = false; renderUsageOverlay(); if (state.setTab === "usage") renderSettings(); scheduleUsageOverlayRefresh(); });
+}
+function scheduleUsageOverlayRefresh() {
+  if (state.usageOverlayTimer) { clearTimeout(state.usageOverlayTimer); state.usageOverlayTimer = null; }
+  if (!state.usageOverlay.enabled) return;
+  /* 主页面不再独立轮询:悬浮窗是独立窗口、由窗口自身按间隔刷新;#usageOverlay 在主页面恒隐藏,轮询纯空转 */
+  if (typeof IS_USAGE_OVERLAY === "undefined" || !IS_USAGE_OVERLAY) return;
+  state.usageOverlayTimer = setTimeout(refreshUsageSummary, Math.max(15, Number(state.usageOverlay.refreshInterval) || 60) * 1000);
+}
+function renderUsageOverlay() {
+  var el = document.getElementById("usageOverlay"); if (!el) return;
+  if (typeof IS_USAGE_OVERLAY !== "undefined" && IS_USAGE_OVERLAY) return;
+  el.innerHTML = "";
+  el.style.display = "none";
+}
+function saveUsageOverlay() {
+  if (state.usageOverlaySaving || state.usageOverlayLoading) return;
+  state.usageOverlaySaving = true; state.usageOverlayError = ""; renderSettings();
+  var requestSeq = ++state.usageOverlayRequestSeq;
+  var settings = {
+    enabled: state.usageOverlay.enabled,
+    opacity: state.usageOverlay.opacity / 100,
+    alwaysOnTop: state.usageOverlay.alwaysOnTop,
+    clickThrough: state.usageOverlay.clickThrough,
+    restoreFullOpacityOnHover: state.usageOverlay.opaqueOnHover,
+    refreshIntervalSecs: state.usageOverlay.refreshInterval,
+  };
+  api.saveUsageOverlaySettings(settings).then(function (raw) {
+    if (requestSeq !== state.usageOverlayRequestSeq) return;
+    state.usageOverlay = normalizeUsageOverlaySettings(raw && (raw.settings || raw.data || raw) || state.usageOverlay);
+    showToast(state.usageOverlay.enabled ? "悬浮窗设置已保存" : "悬浮窗已关闭", "ok"); renderUsageOverlay(); scheduleUsageOverlayRefresh();
+    if (state.usageOverlay.enabled && !state.usageOverlaySummary) refreshUsageSummary();
+  }).catch(function (e) {
+    if (requestSeq !== state.usageOverlayRequestSeq) return;
+    state.usageOverlayError = (e && e.message) || "设置保存失败";
+    showToast("悬浮窗设置保存失败: " + state.usageOverlayError, "error");
+  }).finally(function () {
+    if (requestSeq !== state.usageOverlayRequestSeq) return;
+    state.usageOverlaySaving = false;
+    renderSettings();
+    renderUsageOverlay();
+  });
+}
+function setUsageOverlayVisibility(action) {
+  if (state.usageOverlaySaving || state.usageOverlayLoading) return;
+  state.usageOverlaySaving = true;
+  state.usageOverlayError = "";
+  renderSettings();
+  api.usageOverlayAction(action).then(function (raw) {
+    var source = raw && (raw.settings || raw.data || raw) || state.usageOverlay;
+    state.usageOverlay = normalizeUsageOverlaySettings(source);
+    showToast(action === "show" ? "悬浮窗已打开" : "悬浮窗已隐藏", "ok");
+    renderSettings();
+    renderUsageOverlay();
+    scheduleUsageOverlayRefresh();
+    if (state.usageOverlay.enabled) refreshUsageSummary();
+  }).catch(function (e) {
+    state.usageOverlayError = (e && e.message) || "悬浮窗操作失败";
+    showToast(state.usageOverlayError, "error");
+  }).finally(function () {
+    state.usageOverlaySaving = false;
+    renderSettings();
+  });
+}
+function openUsageOverlayDetails() {
+  state.setTab = "usage";
+  state.view = "usage";
+  state.menuOpen = false;
+  render();
+  doUsageRefresh();
 }
 async function doUsageRefresh() {
   var u = state.usage;
   if (u && u.busy) return;
-  state.usage = { busy: true };
+  var requestSeq = (state.usageRequestSeq || 0) + 1;
+  state.usageRequestSeq = requestSeq;
+  state.usage = Object.assign({}, u || {}, { busy: true, err: "" });
   renderSettings();
+  var providerId = state.usageProviderId || "";
+  var days = state.usageDays || 30;
   try {
-    state.usage = { providers: await api.usageStats() };
+    var result = await Promise.all([
+      api.usageStats(),
+      api.usageSummary(providerId),
+      api.usageHistory(days, providerId),
+      api.usageModels(days, providerId),
+      api.usageModelsHistory(days, providerId).catch(function () { return { items: [] }; }),
+      api.usageRefresh().catch(function () { return null; }),
+    ]);
+    if (requestSeq !== state.usageRequestSeq) return;
+    state.usage = {
+      providers: result[0] || [],
+      syncedAt: result[5] && (result[5].syncedAt || result[5].synced_at),
+      busy: false,
+      err: "",
+    };
+    state.usageSummary = normalizeUsageSummary(result[1]);
+    state.usageHistory = usageList(result[2]);
+    state.usageModels = usageList(result[3]);
+    state.usageModelsHistory = usageList(result[4]);
+    state.usageAnalyticsError = "";
   } catch (e) {
-    state.usage = { err: (e && e.message) || "加载用量统计失败" };
+    if (requestSeq !== state.usageRequestSeq) return;
+    state.usage = Object.assign({}, state.usage || {}, { busy: false, err: (e && e.message) || "加载用量统计失败" });
+    state.usageAnalyticsError = state.usage.err;
   }
-  renderSettings();
+  if (requestSeq === state.usageRequestSeq) renderSettings();
 }
 function setAccountHtml() {
   if (!loggedIn()) {
@@ -2879,14 +3487,17 @@ async function installAvailableUpdate() {
     await api.installUpdate();
     state.updateStatus = { state: "checking", version: upd.latest, downloaded: 0, total: null };
     renderSettings();
+    updatePollFails = 0; /* 新一轮安装:重置失败计数 */
     pollUpdateStatus();
   } catch (e) {
     showToast(e.message || "启动更新失败", "error");
   }
 }
+var updatePollFails = 0; /* 更新状态查询连续失败次数(失败退避用) */
 function pollUpdateStatus() {
   if (state.updatePollTimer) clearTimeout(state.updatePollTimer);
   api.updateStatus().then(function (status) {
+    updatePollFails = 0;
     state.updateStatus = status;
     if (state.setTab === "about") renderSettings();
     if (status && status.state !== "error" && status.state !== "idle") {
@@ -2895,7 +3506,10 @@ function pollUpdateStatus() {
       showToast(status.error || "更新失败", "error");
     }
   }).catch(function () {
-    state.updatePollTimer = setTimeout(pollUpdateStatus, 1000);
+    /* 失败退避:最多 5 次,间隔 1s/2s/4s/8s/16s 递增,之后停止,避免失败路径无限 1s 重试 */
+    updatePollFails++;
+    if (updatePollFails >= 5) { state.updatePollTimer = null; return; }
+    state.updatePollTimer = setTimeout(pollUpdateStatus, 1000 * Math.pow(2, updatePollFails - 1));
   });
 }
 async function doRestoreOfficial() {
@@ -3016,7 +3630,7 @@ document.addEventListener("click", function (ev) {
   }
   var t = ev.target.closest("[data-a]"); if (!t) return;
   var a = t.dataset.a;
-  if ((a === "settings-close" || a === "imp-close" || a === "login-close") && ev.target !== t) return; /* 点遮罩关闭,点内容不关 */
+  if ((a === "imp-close" || a === "login-close") && ev.target !== t) return; /* 点遮罩关闭,点内容不关 */
   switch (a) {
     case "agent":
       state.agent = t.dataset.g; state.view = "dash"; state.diag = null; state.test = null; state.search = "";
@@ -3037,6 +3651,7 @@ document.addEventListener("click", function (ev) {
       }
       if (state.view === "eco") loadEco();
       if (state.view === "plug") plug2Load();
+      if (state.view === "usage") { state.setTab = "usage"; doUsageRefresh(); }
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
     case "eco-agent":
@@ -3280,9 +3895,19 @@ document.addEventListener("click", function (ev) {
     case "accel": doAccel(t.dataset.m); break;
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
     case "settings-open": openSettings(); break;
-    case "settings-close": document.getElementById("setMask").style.display = "none"; break;
+    case "settings-back": state.view = "dash"; render(); break;
     case "set-tab": state.setTab = t.dataset.s; renderSettings(); if (t.dataset.s === "usage") doUsageRefresh(); break;
     case "usage-refresh": doUsageRefresh(); break;
+    case "usage-days":
+      state.usageDays = Math.max(1, Math.min(90, Number(t.dataset.days) || 30));
+      renderSettings();
+      doUsageRefresh();
+      break;
+    case "usage-overlay-visibility": setUsageOverlayVisibility(t.dataset.v); break;
+    case "usage-overlay-save": saveUsageOverlay(); break;
+    case "usage-overlay-refresh": refreshUsageSummary(); break;
+    case "usage-overlay-collapse": state.usageOverlayCompact = !state.usageOverlayCompact; renderUsageOverlay(); break;
+    case "usage-overlay-details": openUsageOverlayDetails(); break;
     case "autostart-toggle": doAutostartToggle(); break;
     case "bal-toggle":
       state.balShow = !state.balShow;
@@ -3297,14 +3922,27 @@ document.addEventListener("click", function (ev) {
     case "login": openLogin(); break;
     case "login-demo": openLogin(); break;
     case "do-login": doLogin(); break;
-    case "login-close": document.getElementById("loginMask").style.display = "none"; break;
+    case "login-close":
+      if (state.loginPhase === "submitting" || state.loginPhase === "slow") break;
+      state.loginRequestSeq++;
+      clearLoginTimer();
+      state.loginBusy = false;
+      state.loginPhase = "idle";
+      document.getElementById("loginMask").style.display = "none";
+      break;
     case "logout": doLogout(); break;
     case "site":
       api.openUrl("https://2xa.cc.cd").then(function () { showToast("已在浏览器打开 2xapi 官网", "ok"); })
         .catch(function (e) { showToast("打开失败,请手动访问 https://2xa.cc.cd(" + e.message + ")", "error"); });
       break;
     case "import-keys": openImport(); break;
-    case "imp-close": document.getElementById("impMask").style.display = "none"; state.importBusy = false; break;
+    case "imp-close":
+      if (!state.importBusy) {
+        state.importRequestSeq++;
+        state.importOpening = false;
+        document.getElementById("impMask").style.display = "none";
+      }
+      break;
     case "imp-do": doImport(); break;
     case "edit": openEdit(t.dataset.id); break;
     case "new": openPresetPicker(); break;
@@ -3481,10 +4119,27 @@ document.addEventListener("change", function (ev) {
     render();
     return;
   }
+  var usageProvider = ev.target.closest("[data-a='usage-provider']");
+  if (usageProvider) {
+    state.usageProviderId = usageProvider.value || "";
+    renderSettings();
+    doUsageRefresh();
+    return;
+  }
   var sauto = ev.target.closest("[data-a='sess-autofix']");
   if (sauto) {
     state.sessionsAutoDraft = sauto.checked;
     render();
+    return;
+  }
+  var overlay = ev.target.closest("[data-a^='usage-overlay-']");
+  if (overlay) {
+    var action = overlay.dataset.a;
+    if (action === "usage-overlay-top") state.usageOverlay.alwaysOnTop = overlay.checked;
+    else if (action === "usage-overlay-click") state.usageOverlay.clickThrough = overlay.checked;
+    else if (action === "usage-overlay-hover") state.usageOverlay.opaqueOnHover = overlay.checked;
+    else if (action === "usage-overlay-interval") state.usageOverlay.refreshInterval = Number(overlay.value) || 60;
+    renderSettings();
     return;
   }
 });
@@ -3503,7 +4158,10 @@ document.addEventListener("input", function (ev) {
   }
   if (ev.target.dataset && ev.target.dataset.a === "plug2-search") {
     PLUG2.q = ev.target.value || "";
-    render();
+    /* 只重绘列表容器,不整页重建(否则搜索框随 innerHTML 重建丢焦点,只能输入一个字符) */
+    var plugListEl = document.getElementById("plug2MarketList");
+    if (plugListEl) plugListEl.innerHTML = plug2MarketListHtml();
+    else render();
     return;
   }
   /* 插件配置页编辑:模型行 / 参数 / 故障转移直接落到 PLUG2 状态,保存时组包提交 */
@@ -3520,8 +4178,15 @@ document.addEventListener("input", function (ev) {
     return;
   }
   if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
-  if (ev.target.dataset && ev.target.dataset.l === "email") { state.loginEmail = ev.target.value; return; }
-  if (ev.target.dataset && ev.target.dataset.l === "password") { state.loginPassword = ev.target.value; return; }
+  if (ev.target.dataset && ev.target.dataset.a === "usage-overlay-opacity") {
+    state.usageOverlay.opacity = Math.max(60, Math.min(100, Number(ev.target.value) || 88));
+    var output = ev.target.parentElement && ev.target.parentElement.querySelector("output");
+    if (output) output.textContent = state.usageOverlay.opacity + "%";
+    renderUsageOverlay();
+    return;
+  }
+  if (ev.target.dataset && ev.target.dataset.l === "email") { state.loginEmail = ev.target.value; state.loginFormDirty = true; return; }
+  if (ev.target.dataset && ev.target.dataset.l === "password") { state.loginPassword = ev.target.value; state.loginFormDirty = true; return; }
 });
 
 /* 自定义浮层 tooltip:悬停立即显示,替代原生 title(插件市场图标按钮用) */
@@ -3601,12 +4266,98 @@ function injectNavAgents() {
     anchor.insertAdjacentHTML("afterend", html);
   }).catch(function (e) { console.warn("agents 注册表拉取失败,维持静态导航", e); });
 }
-injectNavAgents();
-refreshAll().then(render).catch(function (e) { console.error(e); render(); });
-setTimeout(function () { doCheckUpdate(true); }, 3000);
+var IS_USAGE_OVERLAY = new URLSearchParams(window.location.search).get("overlay") === "1";
+function initUsageOverlay() {
+  document.documentElement.classList.add("usage-overlay-page");
+  document.body.classList.add("usage-overlay-page");
+  document.body.innerHTML = '<main class="usage-overlay" id="usageOverlayRoot" data-tauri-drag-region="bare"><div class="usage-overlay-head" data-tauri-drag-region="bare" title="按住拖动窗口"><b>今日 Token</b><span class="usage-overlay-version" id="overlayVersion">v1.0.13</span><span class="usage-overlay-drag" data-tauri-drag-region="bare" aria-hidden="true"></span><button class="usage-overlay-close" data-a="overlay-hide" title="隐藏悬浮窗">×</button></div><div class="usage-overlay-value" id="overlayTotal">暂无数据</div><div class="usage-overlay-meta" id="overlayMeta">正在同步…</div><div class="usage-overlay-foot"><span id="overlayCache">缓存命中率 暂无数据</span><button data-a="overlay-refresh" title="刷新">↻</button></div></main>';
+  var root = document.getElementById("usageOverlayRoot");
+  var refreshButton = root.querySelector("[data-a='overlay-refresh']");
+  var timer = null;
+  var refreshing = false;
+  var settings = usageOverlayDefaults();
+  var lastSummary = null;
+  var disposed = false; /* overlay-hide 后置位:终止轮询链(refreshOverlay finally 不再续排) */
+  api.version().then(function (result) {
+    var badge = document.getElementById("overlayVersion");
+    if (badge && result && result.version) badge.textContent = "v" + result.version;
+  }).catch(function () {});
+  function clearOverlayTimer() {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  }
+  function applyOverlaySettings(raw) {
+    settings = normalizeUsageOverlaySettings(raw);
+    root.style.opacity = String(settings.opacity / 100);
+    root.classList.toggle("opaque-on-hover", settings.opaqueOnHover);
+  }
+  function scheduleOverlayRefresh() {
+    clearOverlayTimer();
+    if (disposed || !settings.enabled) return; /* 已隐藏或关闭 → 不再轮询(去掉原 60s 兜底轮询) */
+    timer = setTimeout(refreshOverlay, Math.max(15, Number(settings.refreshInterval) || 60) * 1000);
+  }
+  function showSummary(summary) {
+    var normalized = normalizeUsageSummary(summary);
+    lastSummary = normalized;
+    var displayNumber = function (value) { return value == null ? "暂无数据" : Number(value).toLocaleString(); };
+    document.getElementById("overlayTotal").textContent = displayNumber(normalized.totalTokens) + " tokens";
+    document.getElementById("overlayMeta").textContent = "输入 " + displayNumber(normalized.inputTokens) + " · 输出 " + displayNumber(normalized.outputTokens) + " · 请求 " + displayNumber(normalized.requests);
+    document.getElementById("overlayCache").textContent = "缓存命中率 " + cacheHitRateText(normalized.cacheHitRate) + " · 今日费用 " + (normalized.cost == null ? "暂无数据" : "$" + normalized.cost);
+  }
+  async function refreshOverlay() {
+    if (refreshing) return;
+    refreshing = true;
+    clearOverlayTimer();
+    if (refreshButton) refreshButton.disabled = true;
+    var total = document.getElementById("overlayTotal");
+    var meta = document.getElementById("overlayMeta");
+    var settingsResult = null;
+    try {
+      var result = await Promise.all([
+        api.usageOverlaySettings().catch(function () { return null; }),
+        api.usageSummary(),
+      ]);
+      settingsResult = result[0];
+      if (settingsResult) applyOverlaySettings(settingsResult);
+      showSummary(result[1]);
+    } catch (error) {
+      meta.textContent = lastSummary ? "同步失败，保留上次数据" : "同步失败，请稍后重试";
+      if (!settingsResult) clearOverlayTimer();
+    } finally {
+      refreshing = false;
+      if (refreshButton) refreshButton.disabled = false;
+      if (!disposed) scheduleOverlayRefresh(); /* 已隐藏 → 不再续排,终止轮询链 */
+    }
+  }
+  document.addEventListener("click", function (event) {
+    var button = event.target && event.target.closest ? event.target.closest("[data-a]") : null;
+    if (!button || !root.contains(button)) return;
+    var action = button.dataset.a;
+    if (action === "overlay-hide") {
+      disposed = true; /* 置位并清定时器:隐藏后 refreshOverlay finally 不再续排,轮询终止 */
+      clearOverlayTimer();
+      api.usageOverlayAction("hide").then(function (raw) {
+        applyOverlaySettings(raw);
+        markUsageOverlayHidden();
+      }).catch(function () {});
+    } else if (action === "overlay-refresh") refreshOverlay();
+  });
+  refreshOverlay();
+}
+if (IS_USAGE_OVERLAY) {
+  initUsageOverlay();
+} else {
+  injectNavAgents();
+  render();
+  Promise.all([refreshAll(), refreshAppVersion()]).then(render).catch(function (e) { console.error(e); render(); });
+  setTimeout(function () { doCheckUpdate(true); }, 3000);
+}
 
 /* 预设层搜索框绑定(input 事件,委托外单独绑) */
-document.getElementById("presetSearch").addEventListener("input", function (e) {
-  presetQuery = e.target.value || "";
-  renderPresetGrid();
-});
+if (!IS_USAGE_OVERLAY) {
+  var presetSearch = document.getElementById("presetSearch");
+  if (presetSearch) presetSearch.addEventListener("input", function (e) {
+    presetQuery = e.target.value || "";
+    renderPresetGrid();
+  });
+}

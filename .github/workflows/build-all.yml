@@ -34,11 +34,35 @@ jobs:
       - name: Validate release version
         if: startsWith(github.ref, 'refs/tags/')
         run: bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+      - name: Import Apple Developer certificate
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/developer_cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
       - name: Build signed bundles
         working-directory: src-tauri
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple 签名/公证:tauri-bundler 仅在 APPLE_CERTIFICATE env 存在或 signingIdentity
+          # 已配置时才签名(不会自动扫描 keychain),故证书与密码必须传入 Build 步
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # 公证凭据(app-specific password);未配置则跳过公证
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: cargo tauri build --target ${{ matrix.target }}
       - name: Normalize release assets
         env:
@@ -93,13 +117,20 @@ jobs:
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $root = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          $signature = Get-ChildItem "$root/nsis" -Filter "*.sig" | Select-Object -First 1
-          if (-not $signature) { throw "Windows updater signature not found" }
-          $updater = $signature.FullName.Substring(0, $signature.FullName.Length - 4)
-          $suffix = if ($updater.EndsWith(".zip")) { ".nsis.zip" } else { ".exe" }
-          $name = "2xapi-codex-console_${version}_windows_x86_64${suffix}"
-          Copy-Item $updater "release-assets/$name"
-          Copy-Item $signature.FullName "release-assets/$name.sig"
+          # 显式匹配,避免在 .exe.sig 与 .nsis.zip.sig 之间取到不确定的文件
+          $zipSig = Get-ChildItem "$root/nsis" -Filter "*.nsis.zip.sig" | Select-Object -First 1
+          if ($zipSig) {
+            $zipUpdater = $zipSig.FullName.Substring(0, $zipSig.FullName.Length - 4)
+            $name = "2xapi-codex-console_${version}_windows_x86_64.nsis.zip"
+            Copy-Item $zipUpdater "release-assets/$name"
+            Copy-Item $zipSig.FullName "release-assets/$name.sig"
+          }
+          $exeSig = Get-ChildItem "$root/nsis" -Filter "*.exe.sig" | Select-Object -First 1
+          if (-not $exeSig) { throw "Windows standalone installer signature not found" }
+          $exeUpdater = $exeSig.FullName.Substring(0, $exeSig.FullName.Length - 4)
+          $name = "2xapi-codex-console_${version}_windows_x86_64.exe"
+          Copy-Item $exeUpdater "release-assets/$name"
+          Copy-Item $exeSig.FullName "release-assets/$name.sig"
           Get-ChildItem "$root/msi" -Filter "*.msi" | Select-Object -First 1 | Copy-Item -Destination "release-assets/2xapi-codex-console_${version}_windows_x86_64.msi"
       - uses: actions/upload-artifact@v4
         with:
@@ -127,7 +158,7 @@ jobs:
           base_url="https://github.com/$REPO/releases/download/$TAG"
           mac_arm_sig=$(find release-assets -name '*_macos_aarch64.app.tar.gz.sig' -print -quit)
           mac_x64_sig=$(find release-assets -name '*_macos_x86_64.app.tar.gz.sig' -print -quit)
-          win_sig=$(find release-assets -name '*_windows_x86_64*.sig' -print -quit)
+          win_sig=$(find release-assets -name '*_windows_x86_64.nsis.zip.sig' -print -quit)
           test -n "$mac_arm_sig" && test -n "$mac_x64_sig" && test -n "$win_sig"
           jq -n \
             --arg version "$version" \

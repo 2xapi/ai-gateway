@@ -30,6 +30,7 @@ mod providers;
 mod registry;
 mod sessions;
 mod updater;
+mod usage_overlay;
 mod usage_stats;
 
 use std::net::TcpListener;
@@ -436,6 +437,7 @@ fn main() {
     let router = server::build_router(state);
 
     // Start HTTP server in a dedicated thread with its own tokio runtime
+    let codex_home_for_server = codex_home.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -450,7 +452,7 @@ fn main() {
             // 未配置时静默跳过,不影响内置/缓存表)。
             crate::acclines::spawn_refresh_loop(
                 health_state.clone(),
-                codex_home.clone(),
+                codex_home_for_server.clone(),
                 std::time::Duration::from_secs(3600),
             );
             axum::serve(listener, router).await.unwrap();
@@ -461,6 +463,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             updater::init(app.handle().clone()).map_err(std::io::Error::other)?;
+            usage_overlay::register_app_handle(app.handle().clone());
             app.manage(state_for_app);
 
             let window = WebviewWindowBuilder::new(
@@ -472,6 +475,27 @@ fn main() {
             .inner_size(1000.0, 720.0)
             .min_inner_size(800.0, 600.0)
             .build()?;
+
+            let overlay_settings = usage_overlay::load_settings(&codex_home).unwrap_or_default();
+            match WebviewWindowBuilder::new(
+                app,
+                usage_overlay::WINDOW_LABEL,
+                tauri::WebviewUrl::External(format!("{app_url}/?overlay=1").parse().unwrap()),
+            )
+            .title("今日 Token 用量")
+            .inner_size(320.0, 190.0)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(overlay_settings.always_on_top)
+            .skip_taskbar(true)
+            .visible(false)
+            .build()
+            {
+                Ok(overlay) => {
+                    let _ = usage_overlay::apply_window_settings(&overlay, &overlay_settings);
+                }
+                Err(error) => eprintln!("[overlay] 创建悬浮窗失败: {error}"),
+            }
 
             // 关窗口 → 隐藏而非退出（保持网关 8787 常驻；从托盘重新显示/退出）
             let wh = window.clone();

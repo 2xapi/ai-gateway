@@ -303,8 +303,22 @@ pub async fn handle_delete(
 /// URL 即凭证,不区分「id 不存在」与「ext 不符」(不额外暴露信息)。
 pub async fn handle_serve(
     State(s): State<std::sync::Arc<crate::server::AppState>>,
+    headers: axum::http::HeaderMap,
     AxumPath(file): AxumPath<String>,
 ) -> Response {
+    // 跨源页面无法带自定义 header 但会带 Referer;<img> 直接引用已知 uuid 会显示文件。
+    // Referer 存在且非本机来源 → 拒(防跨源网页把本机媒体文件当图床);无 Referer(curl/直访)放行,
+    // uuid 不可枚举已缓解。
+    if let Some(referer) = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let ok = referer.starts_with("http://127.0.0.1:8787")
+            || referer.starts_with("http://localhost:8787");
+        if !ok {
+            return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        }
+    }
     let Some((id, ext)) = file.rsplit_once('.') else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };

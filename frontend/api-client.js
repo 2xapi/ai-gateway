@@ -14,20 +14,70 @@
     return fallback;
   }
 
-  async function request(method, path, { body } = {}) {
+  const DEFAULT_TIMEOUT_MS = 20000;
+  const LOGIN_TIMEOUT_MS = 30000;
+
+  function networkError(error) {
+    const detail = error && error.message ? error.message : error;
+    const message = global.location && global.location.protocol === "file:"
+      ? "当前页面是直接打开的 HTML 文件，请启动 2xapi Codex Console.app 后再登录"
+      : "网络请求失败：" + detail;
+    const network = new Error(message);
+    network.code = "E_NETWORK";
+    return network;
+  }
+
+  async function fetchWithTimeout(path, opts, timeoutMs) {
+    if (typeof global.AbortController !== "function") return fetch(path, opts);
+    const controller = new global.AbortController();
+    let timedOut = false;
+    let timer = setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs || DEFAULT_TIMEOUT_MS);
+    opts.signal = controller.signal;
+    try {
+      return await fetch(path, opts);
+    } catch (error) {
+      if (timedOut) {
+        const timeout = new Error("请求超时，请检查网络后重试");
+        timeout.code = "E_TIMEOUT";
+        timeout.path = path;
+        throw timeout;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  // per-run token 鉴权契约:后端向页面注入 window.__TWOXAPI_TOKEN__;存在则每个请求附加 X-2xapi-Token。
+  // 页面与 API 同由本地网关服务(同源),自定义 header 不会触发 CORS 预检,直接附加即可。
+  // 后端把 token 放在 <html data-twoxapi-token="...">,此处桥接到 window 供 tokenHeaders 使用。
+  (function () {
+    const attr = document.documentElement && document.documentElement.getAttribute("data-twoxapi-token");
+    if (attr) global.__TWOXAPI_TOKEN__ = attr;
+  })();
+  function tokenHeaders() {
+    const token = global.__TWOXAPI_TOKEN__;
+    if (!token) return {};
+    return { "X-2xapi-Token": token };
+  }
+
+  async function request(method, path, { body, timeoutMs } = {}) {
     const opts = {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()),
       credentials: "same-origin",
     };
     if (body !== undefined) opts.body = JSON.stringify(body);
     let resp;
     try {
-      resp = await fetch(path, opts);
-    } catch (e) {
-      const err = new Error("网络请求失败：" + (e && e.message ? e.message : e));
-      err.code = "E_NETWORK";
-      throw err;
+      resp = await fetchWithTimeout(path, opts, timeoutMs);
+    } catch (error) {
+      if (error && (error.code === "E_TIMEOUT" || error.code === "E_NETWORK")) throw error;
+      throw networkError(error);
     }
     const payload = await resp.json().catch(() => ({}));
     if (payload && payload.ok === true) return payload.data;
@@ -42,16 +92,15 @@
   }
 
   // raw 请求（auth 子系统等不走 04 信封的路由）
-  async function rawJson(method, path, body) {
-    const opts = { method, headers: { "Content-Type": "application/json" }, credentials: "same-origin" };
+  async function rawJson(method, path, body, timeoutMs) {
+    const opts = { method, headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin" };
     if (body !== undefined) opts.body = JSON.stringify(body);
     let resp;
     try {
-      resp = await fetch(path, opts);
+      resp = await fetchWithTimeout(path, opts, timeoutMs);
     } catch (error) {
-      const networkError = new Error("网络请求失败：" + (error && error.message ? error.message : error));
-      networkError.code = "E_NETWORK";
-      throw networkError;
+      if (error && (error.code === "E_TIMEOUT" || error.code === "E_NETWORK")) throw error;
+      throw networkError(error);
     }
     const payload = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -100,7 +149,7 @@
     let resp;
     try {
       resp = await fetch(path, {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ way: way || "", providerId: providerId || "" }),
       });
     } catch (error) {
@@ -162,7 +211,7 @@
         captchaTicket: captchaTicket || "",
         captchaRandstr: captchaRandstr || "",
         remember: remember !== false,
-      }),
+      }, LOGIN_TIMEOUT_MS),
     logout: async () => rawJson("POST", "/api/auth/logout", {}),
     remembered: async () => rawJson("GET", "/api/auth/remembered"),
     remember: async (email, password) => rawJson("POST", "/api/auth/remember", { email, password }),
@@ -206,7 +255,7 @@
   plugInstallId: (id) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/install"),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ providerId, way }),
       });
       const payload = await resp.json().catch(() => ({}));
@@ -218,7 +267,7 @@
     },
     desktopUnhost: async () => {
       const resp = await fetch("/api/desktop/unhost", {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
       });
       const payload = await resp.json().catch(() => ({}));
       if (resp.ok && payload && payload.ok === true) return payload.data;
@@ -235,7 +284,7 @@
     agentState: (agent) => request("GET", "/api/desktop/" + agent + "/state"),
     agentHost: async (agent, providerId, way) => {
       const resp = await fetch("/api/desktop/" + agent + "/host", {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ providerId: providerId, way: way || "gateway" }),
       });
       const payload = await resp.json().catch(() => ({}));
@@ -247,7 +296,7 @@
     },
     agentUnhost: async (agent) => {
       const resp = await fetch("/api/desktop/" + agent + "/unhost", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), body: "{}",
       });
       const v = await resp.json().catch(() => null);
       if (!resp.ok || (v && v.ok === false)) throw new Error((v && v.error && v.error.message) || ("HTTP " + resp.status));
@@ -256,7 +305,7 @@
     // 注入式启动命令(gemini 等;返回 {command, env, hint...},Key 为占位)
     agentStart: async (agent, way, providerId) => {
       const resp = await fetch("/api/desktop/" + agent + "/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()),
         body: JSON.stringify({ way: way || "gateway", providerId: providerId || "" }),
       });
       const v = await resp.json().catch(() => null);
@@ -295,9 +344,52 @@
     // ── 用量仪表盘(用量仪表盘后端批次):GET /api/usage-stats 非信封 {providers:[{providerId,providerName,count,p50Ms,p90Ms,okRate,lastTs,routes}]} ──
     usageStats: async () => {
       const p = await rawJson("GET", "/api/usage-stats");
-      return p && Array.isArray(p.providers) ? p.providers : [];
+      const providers = p && Array.isArray(p.providers) ? p.providers : [];
+      return providers.map((item) => {
+        const row = item || {};
+        const rate = row.okRate != null ? row.okRate : row.ok_rate;
+        const count = row.count != null ? row.count : (row.requestCount != null ? row.requestCount : row.request_count);
+        return {
+          providerId: row.providerId || row.provider_id || "",
+          providerName: row.providerName || row.provider_name || row.providerId || row.provider_id || "",
+          count: Number(count) || 0,
+          p50Ms: row.p50Ms != null ? row.p50Ms : row.p50_ms,
+          p90Ms: row.p90Ms != null ? row.p90Ms : row.p90_ms,
+          okRate: rate == null ? null : (Number(rate) > 1 ? Number(rate) / 100 : Number(rate)),
+          lastTs: row.lastTs != null ? row.lastTs : row.last_ts,
+          routes: Array.isArray(row.routes) ? row.routes : [],
+          directFallbackCount: Number(row.directFallbackCount != null ? row.directFallbackCount : row.direct_fallback_count) || 0,
+        };
+      });
     },
-
+    // 用量悬浮窗专用契约；失败由 UI 保留上次成功状态和摘要。
+    usageOverlaySettings: () => request("GET", "/api/settings/usage-overlay"),
+    saveUsageOverlaySettings: (settings) => request("PUT", "/api/settings/usage-overlay", { body: settings }),
+    usageOverlayAction: (action) => request("POST", "/api/settings/usage-overlay/action", { body: { action } }),
+    usageSummary: (providerId, date) => {
+      const query = new URLSearchParams();
+      if (providerId) query.set("provider_id", providerId);
+      if (date) query.set("date", date);
+      const suffix = query.toString();
+      return request("GET", "/api/usage/summary" + (suffix ? "?" + suffix : ""));
+    },
+    usageHistory: (days, providerId) => {
+      const query = new URLSearchParams({ days: String(days || 30) });
+      if (providerId) query.set("provider_id", providerId);
+      return request("GET", "/api/usage/history?" + query.toString());
+    },
+    usageModels: (days, providerId) => {
+      const query = new URLSearchParams({ days: String(days || 30) });
+      if (providerId) query.set("provider_id", providerId);
+      return request("GET", "/api/usage/models?" + query.toString());
+    },
+    usageModelsHistory: (days, providerId) => {
+      const query = new URLSearchParams({ days: String(days || 30) });
+      if (providerId) query.set("provider_id", providerId);
+      return request("GET", "/api/usage/models-history?" + query.toString());
+    },
+    usageRefresh: () => request("POST", "/api/usage/refresh", { timeoutMs: 60000 }),
+    // 用量悬浮窗：后端尚未提供时由调用方保留当前 UI 状态，不把失败当作空数据。
     // refresh-cred 契约:200 {ok:true, usage:{...}} / 4xx {error:"人话"}(非信封,顶层字段;4xx 由 rawJson 抛 error)
     accelRefreshCred: async () => {
       const p = await rawJson("POST", "/api/accel/refresh-cred", {});
@@ -327,7 +419,7 @@
     sessionsDeletePreview: (ids) => request("POST", "/api/sessions/delete-preview", { body: { ids: ids } }),
     sessionsDelete: (confirmToken) => request("POST", "/api/sessions/delete", { body: { confirmToken: confirmToken } }),
     sessionsUndoDelete: (backupId) => request("POST", "/api/sessions/delete/undo", { body: { backupId: backupId } }),
-    sessionsRestartCodex: () => request("POST", "/api/sessions/restart-codex", { body: {} }),
+    sessionsRestartCodex: () => request("POST", "/api/sessions/restart-codex", { body: {}, timeoutMs: 60000 }),
     sessionsSettings: () => request("GET", "/api/sessions/settings"),
     sessionsSetSettings: (autoRepair) => request("POST", "/api/sessions/settings", { body: { autoRepairBeforeLaunch: autoRepair } }),
     // ── Claude 会话历史(R2:只读列表;~/.claude/projects jsonl,无修复/删除)──
@@ -335,8 +427,8 @@
 
     // ── 运维：备份/快照/恢复/历史诊断（旧路由，raw 响应）──
     backups: async () => rawJson("GET", "/api/backups"),
-    snapshot: async () => rawJson("POST", "/api/config/snapshot", {}),
-    restoreConfig: async (backupPath) => rawJson("POST", "/api/config/restore", { backupPath }),
+    snapshot: async () => rawJson("POST", "/api/config/snapshot", {}, 60000),
+    restoreConfig: async (backupPath) => rawJson("POST", "/api/config/restore", { backupPath }, 60000),
     inspectHistory: async () => rawJson("GET", "/api/history/inspect"),
   };
 })(window);

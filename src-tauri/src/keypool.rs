@@ -53,7 +53,7 @@ impl KeyPool {
         if keys.len() <= 1 {
             return keys.into_iter().next().unwrap_or_default();
         }
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = map.entry(p.id.clone()).or_insert_with(|| PoolEntry {
             keys: keys.clone(),
             cursor: 0,
@@ -105,7 +105,7 @@ impl KeyPool {
 
     /// 标失败(429/5xx/超时):冷却该 Key(按值匹配,池内重复 key 一并冷却)。
     pub fn mark_failure(&self, provider_id: &str, key: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = map.get_mut(provider_id) else {
             return;
         };
@@ -121,7 +121,7 @@ impl KeyPool {
 
     /// 标成功:清该供应商全部冷却(成功说明上游恢复)。
     pub fn mark_success(&self, provider_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = map.get_mut(provider_id) {
             for slot in entry.cooldown_until.iter_mut() {
                 *slot = None;
@@ -203,7 +203,7 @@ mod tests {
         let pool = KeyPool::new();
         let _ = pool.pick(&p);
         {
-            let mut map = pool.inner.lock().unwrap();
+            let mut map = pool.inner.lock().unwrap_or_else(|p| p.into_inner());
             let e = map.get_mut("a").unwrap();
             e.cooldown_until[0] = Some(Instant::now() + Duration::from_secs(50));
             e.cooldown_until[1] = Some(Instant::now() + Duration::from_secs(10));
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(pool.pick(&p3), "k2", "对齐后仍跳过冷却中的 k1");
         assert_eq!(pool.pick(&p3), "k3", "新 key 参与轮询");
         {
-            let map = pool.inner.lock().unwrap();
+            let map = pool.inner.lock().unwrap_or_else(|p| p.into_inner());
             let e = map.get("r").unwrap();
             assert_eq!(e.cooldown_until.len(), 3, "冷却表随池伸缩");
         }

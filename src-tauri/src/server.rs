@@ -1,6 +1,10 @@
+#[cfg(not(test))]
+use axum::http::Request;
+#[cfg(not(test))]
+use axum::middleware::{self, Next};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -9,7 +13,100 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
+
+/// 与 tauri.conf.json security.csp 保持一致；Axum 侧必须自己输出，
+/// Tauri 的 CSP 注入只对 tauri:// 资产协议生效，External URL 页面不生效。
+const CSP: &str = "default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// 本次运行的网关鉴权 token：注入到页面 HTML(data-twoxapi-token)供前端带上
+/// `X-2xapi-Token`，防 DNS rebinding/跨源网页直接调用本地 API。
+/// 静态路径(/, /app.js 等)公开；/api/* 与全部代理路径需要 token。
+static GATEWAY_TOKEN: OnceLock<String> = OnceLock::new();
+
+pub fn init_gateway_token() -> String {
+    GATEWAY_TOKEN
+        .get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+        .clone()
+}
+
+#[cfg(not(test))]
+fn host_allowed(headers: &header::HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    let hostname = if host.starts_with('[') {
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(hostname, "127.0.0.1" | "localhost" | "::1")
+}
+
+#[cfg(not(test))]
+fn origin_allowed(headers: &header::HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    matches!(origin, "http://127.0.0.1:8787" | "http://localhost:8787")
+}
+
+fn path_needs_auth(path: &str) -> bool {
+    if path.starts_with("/api/") {
+        return path != "/api/bootstrap";
+    }
+    [
+        "/v1/",
+        "/v1beta/",
+        "/anthropic/",
+        "/hermes/",
+        "/cursor/",
+        "/opencode/",
+        "/openclaw/",
+        "/grokbuild/",
+        "/grok/",
+        "/workbuddy/",
+        "/claude-desktop/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+        || matches!(
+            path,
+            "/responses" | "/chat/completions" | "/images/generations" | "/models"
+        )
+}
+
+#[cfg(not(test))]
+async fn gateway_auth(State(token): State<String>, req: Request<Body>, next: Next) -> Response {
+    let headers = req.headers();
+    if !host_allowed(headers) || !origin_allowed(headers) {
+        return err_json(StatusCode::UNAUTHORIZED, "非法请求来源");
+    }
+    if !path_needs_auth(req.uri().path()) {
+        return next.run(req).await;
+    }
+    // 威胁模型:本防护针对「浏览器跨源(DNS rebinding/恶意网页)」。
+    // 恶意网页的请求必带恶意 Host(URL 主机名)或跨源 Origin,已被上方拦截。
+    // CLI 客户端(Codex/Claude Code/Cursor/Gemini 等)经 /v1/* 代理路径请求时
+    // 无 Origin(非浏览器)且无法携带页面 token——视为本机可信进程放行,
+    // 与「同用户进程可读本地文件」的既有威胁模型一致。
+    if headers.get(header::ORIGIN).is_none() {
+        return next.run(req).await;
+    }
+    let provided = headers
+        .get("x-2xapi-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided == token {
+        next.run(req).await
+    } else {
+        err_json(StatusCode::UNAUTHORIZED, "缺少网关访问凭证")
+    }
+}
 
 #[derive(RustEmbed)]
 #[folder = "../frontend/"]
@@ -72,7 +169,7 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     let state = Arc::new(state);
-    Router::new()
+    let router = Router::new()
         // --- Static frontend ---
         .route("/", get(serve_index))
         .fallback(serve_static)
@@ -319,9 +416,33 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/media/:id", delete(crate::media::handle_delete))
         // 用量仪表盘(竞品吸收项):按 provider 聚合 P50/P90/请求量/成功率
         .route("/api/usage-stats", get(handle_usage_stats))
+        .route("/api/usage/summary", get(handle_usage_summary))
+        .route("/api/usage/history", get(handle_usage_history))
+        .route("/api/usage/models", get(handle_usage_models))
+        .route(
+            "/api/usage/models-history",
+            get(handle_usage_models_history),
+        )
+        .route("/api/usage/refresh", post(handle_usage_refresh))
+        .route(
+            "/api/settings/usage-overlay",
+            get(handle_usage_overlay_get).put(handle_usage_overlay_put),
+        )
+        .route(
+            "/api/settings/usage-overlay/action",
+            post(handle_usage_overlay_action),
+        )
         // http 型插件(超融合二期):登记/启停/删除/invoke 代理
         .merge(crate::plugins::routes())
-        .with_state(state)
+        .with_state(state);
+    // 网关鉴权:生产构建启用(防 DNS rebinding/跨源网页调本地 API);
+    // 测试构建豁免,鉴权行为由运行时冒烟验证(业务单测不携带 token)
+    #[cfg(not(test))]
+    let router = router.layer(middleware::from_fn_with_state(
+        init_gateway_token(),
+        gateway_auth,
+    ));
+    router
 }
 
 // --- Helpers ---
@@ -362,11 +483,20 @@ fn val_errs_env(errs: &[crate::providers::ValidationError]) -> Response {
     )
 }
 
+fn index_html_with_token() -> Option<Body> {
+    let file = FrontendAsset::get("index.html")?;
+    let token = init_gateway_token();
+    let html = String::from_utf8_lossy(file.data.as_ref());
+    let html = html.replacen("<html", &format!("<html data-twoxapi-token=\"{token}\""), 1);
+    Some(Body::from(html))
+}
+
 async fn serve_index() -> Response {
-    match FrontendAsset::get("index.html") {
-        Some(file) => Response::builder()
+    match index_html_with_token() {
+        Some(body) => Response::builder()
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(Body::from(file.data.into_owned()))
+            .header(header::CONTENT_SECURITY_POLICY, CSP)
+            .body(body)
             .unwrap(),
         None => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
     }
@@ -388,13 +518,15 @@ async fn serve_static(uri: Uri) -> Response {
             Response::builder()
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, "no-store")
+                .header(header::CONTENT_SECURITY_POLICY, CSP)
                 .body(Body::from(f.data.into_owned()))
                 .unwrap()
         }
-        None => match FrontendAsset::get("index.html") {
-            Some(index) => Response::builder()
+        None => match index_html_with_token() {
+            Some(body) => Response::builder()
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .body(Body::from(index.data.into_owned()))
+                .header(header::CONTENT_SECURITY_POLICY, CSP)
+                .body(body)
                 .unwrap(),
             None => (StatusCode::NOT_FOUND, "not found").into_response(),
         },
@@ -471,6 +603,22 @@ async fn handle_open_url(Json(body): Json<Value>) -> Response {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": "仅支持 http(s) 链接" })),
+        )
+            .into_response();
+    }
+    // Windows 走 cmd /C start:url 含 cmd 元字符即命令注入(&|^%! 与空白、引号)——拒绝。
+    // macOS/Linux 走参数向量(open/xdg-open),无 shell 解释,仅拒绝空白与引号类危险字符,
+    // 允许 &、%(URL query/编码的合法字符),避免误拒带参数的正常链接。
+    #[cfg(target_os = "windows")]
+    let url_invalid = url
+        .chars()
+        .any(|c| c.is_whitespace() || "&|^<>%!\"'`".contains(c));
+    #[cfg(not(target_os = "windows"))]
+    let url_invalid = url.chars().any(|c| c.is_whitespace() || "\"'`".contains(c));
+    if url_invalid {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "链接包含非法字符" })),
         )
             .into_response();
     }
@@ -605,7 +753,11 @@ async fn handle_auth_api_keys(State(s): State<Arc<AppState>>) -> Response {
     let Some(session) = session else {
         return err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号");
     };
-    let keys = match crate::auth::fetch_api_keys(&session.access_token).await {
+    let (keys_result, base_url_result) = tokio::join!(
+        crate::auth::fetch_api_keys(&session.access_token),
+        crate::auth::fetch_relay_base_url()
+    );
+    let keys = match keys_result {
         Ok(v) => {
             let d = v.get("data").cloned().unwrap_or(json!([]));
             // 部署版为 {items:[...]}(main 分支为直接数组)——两种都兼容
@@ -622,9 +774,7 @@ async fn handle_auth_api_keys(State(s): State<Arc<AppState>>) -> Response {
             )
         }
     };
-    let base_url = crate::auth::fetch_relay_base_url()
-        .await
-        .unwrap_or_else(|_| "https://2xa.cc.cd".into());
+    let base_url = base_url_result.unwrap_or_else(|_| "https://2xa.cc.cd".into());
     ok_json(json!({ "keys": keys, "baseUrl": base_url }))
 }
 
@@ -932,11 +1082,14 @@ async fn handle_providers_fetch_models(
         Vec::new()
     };
     if let Some(wid) = write_back_id {
-        let mut data = crate::providers::load(&s.providers_path);
-        if let Some(p) = data.providers.iter_mut().find(|p| p.id == wid) {
-            p.models = models.clone();
+        // 探测失败(网络/上游异常)返回空列表时不落盘清空已存模型表,保留原值
+        if !models.is_empty() {
+            let mut data = crate::providers::load(&s.providers_path);
+            if let Some(p) = data.providers.iter_mut().find(|p| p.id == wid) {
+                p.models = models.clone();
+            }
+            let _ = crate::providers::store(&s.providers_path, &data);
         }
-        let _ = crate::providers::store(&s.providers_path, &data);
     }
     ok_env(json!({ "models": models, "reasoning_levels": levels }))
 }
@@ -1069,6 +1222,7 @@ pub fn load_accel_cfg(codex_home: &std::path::Path) -> AccelCfg {
 
 /// 写 `accel` 段(保留文件其余段);失败时返回错误,避免接口误报成功。
 pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) -> Result<(), String> {
+    let _save_guard = crate::usage_overlay::settings_write_lock()?;
     std::fs::create_dir_all(codex_home).map_err(|e| format!("创建配置目录失败: {e}"))?;
     let path = accel_settings_path(codex_home);
     let raw = match std::fs::read_to_string(&path) {
@@ -1090,7 +1244,23 @@ pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) -> Result<()
     );
     let encoded =
         serde_json::to_string_pretty(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
-    std::fs::write(path, encoded).map_err(|e| format!("写入配置失败: {e}"))
+    // 原子写(与 usage_overlay 一致):临时文件 + 0600 + rename,崩溃不截断整个设置文件
+    // 原子写(与 usage_overlay 一致):临时文件 + 0600 + rename,崩溃不截断整个设置文件。
+    // 临时名带进程内计数器,避免并行调用(含并发测试)共用同一 tmp 路径互相覆盖。
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, encoded).map_err(|e| format!("写临时配置失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置临时配置权限失败: {e}"))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
 }
 
 fn validate_accel_endpoint(endpoint: &str) -> Result<String, &'static str> {
@@ -1229,7 +1399,238 @@ fn usage_for_state(state: &AppState, mode: &str) -> Value {
 // GET /api/accel/state → {mode, customNode, lines, scopeNote, usage}
 // GET /api/usage-stats → 用量仪表盘聚合(读取 usage-stats.jsonl;无数据空数组)。
 async fn handle_usage_stats(State(s): State<Arc<AppState>>) -> Response {
-    ok_json(crate::usage_stats::summary(&s.codex_home))
+    // 统计查询含磁盘读+全量 JSONL 解析,移出 async 热路径,避免阻塞网关请求
+    let home = s.codex_home.clone();
+    let summary = tokio::task::spawn_blocking(move || crate::usage_stats::summary(&home))
+        .await
+        .unwrap_or_else(|_| json!({ "providers": [], "err": "统计查询失败" }));
+    ok_json(summary)
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageRangeQuery {
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default = "default_usage_days")]
+    days: u32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UsageSummaryQuery {
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+fn default_usage_days() -> u32 {
+    30
+}
+
+async fn handle_usage_summary(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<UsageSummaryQuery>,
+) -> Response {
+    if let Some(date) = query.date.as_deref() {
+        if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            return err_env(
+                StatusCode::BAD_REQUEST,
+                "E_BAD_REQUEST",
+                "date 必须是 YYYY-MM-DD",
+                Some(vec!["date".into()]),
+            );
+        }
+    }
+    let home = s.codex_home.clone();
+    let provider_id = query.provider_id.clone();
+    let date = query.date.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        crate::usage_stats::usage_summary_filtered(
+            &home,
+            chrono::Utc::now().timestamp(),
+            provider_id.as_deref(),
+            date.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| json!({}));
+    ok_env(summary)
+}
+
+async fn handle_usage_history(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<UsageRangeQuery>,
+) -> Response {
+    let days = query.days.clamp(1, 366);
+    let home = s.codex_home.clone();
+    let provider_id = query.provider_id.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        crate::usage_stats::usage_history_filtered(
+            &home,
+            chrono::Utc::now().timestamp(),
+            days,
+            provider_id.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    ok_env(json!({ "days": days, "items": items }))
+}
+
+async fn handle_usage_models(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<UsageRangeQuery>,
+) -> Response {
+    let days = query.days.clamp(1, 366);
+    let home = s.codex_home.clone();
+    let provider_id = query.provider_id.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        crate::usage_stats::usage_models_filtered(
+            &home,
+            chrono::Utc::now().timestamp(),
+            days,
+            provider_id.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    ok_env(json!({ "days": days, "items": items }))
+}
+
+async fn handle_usage_models_history(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<UsageRangeQuery>,
+) -> Response {
+    let days = query.days.clamp(1, 366);
+    let home = s.codex_home.clone();
+    let provider_id = query.provider_id.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        crate::usage_stats::usage_models_history_filtered(
+            &home,
+            chrono::Utc::now().timestamp(),
+            days,
+            provider_id.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    ok_env(json!({ "days": days, "items": items }))
+}
+
+async fn handle_usage_refresh(State(s): State<Arc<AppState>>) -> Response {
+    let home = s.codex_home.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        crate::usage_stats::usage_summary(&home, chrono::Utc::now().timestamp())
+    })
+    .await
+    .unwrap_or_else(|_| json!({}));
+    ok_env(json!({
+        "syncedAt": chrono::Utc::now().to_rfc3339(),
+        "source": "local_gateway",
+        "summary": summary,
+    }))
+}
+
+async fn handle_usage_overlay_get(State(s): State<Arc<AppState>>) -> Response {
+    match crate::usage_overlay::load_settings(&s.codex_home) {
+        Ok(settings) => ok_env(serde_json::to_value(settings).unwrap_or_else(|_| json!({}))),
+        Err(error) => err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SETTINGS",
+            &error,
+            None,
+        ),
+    }
+}
+
+async fn handle_usage_overlay_put(
+    State(s): State<Arc<AppState>>,
+    Json(settings): Json<crate::usage_overlay::UsageOverlaySettings>,
+) -> Response {
+    if let Err(errors) = settings.validate() {
+        return err_env(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "E_VALIDATION",
+            &errors.join("；"),
+            None,
+        );
+    }
+    if let Err(error) = crate::usage_overlay::save_settings(&s.codex_home, &settings) {
+        return err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SETTINGS",
+            &error,
+            None,
+        );
+    }
+    let window_result = crate::usage_overlay::with_window(|window| {
+        crate::usage_overlay::apply_window_settings(window, &settings)
+    });
+    if let Err(error) = window_result {
+        eprintln!("[overlay] 应用窗口设置失败: {error}");
+        return err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_WINDOW",
+            &format!("设置已保存，但悬浮窗应用失败: {error}"),
+            None,
+        );
+    }
+    ok_env(serde_json::to_value(settings).unwrap_or_else(|_| json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageOverlayAction {
+    action: String,
+}
+
+async fn handle_usage_overlay_action(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<UsageOverlayAction>,
+) -> Response {
+    let mut settings = match crate::usage_overlay::load_settings(&s.codex_home) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_env(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "E_SETTINGS",
+                &error,
+                None,
+            )
+        }
+    };
+    match body.action.as_str() {
+        "show" => settings.enabled = true,
+        "hide" => settings.enabled = false,
+        "toggle" => settings.enabled = !settings.enabled,
+        "refresh" => {}
+        _ => {
+            return err_env(
+                StatusCode::BAD_REQUEST,
+                "E_ACTION",
+                "不支持的悬浮窗操作",
+                None,
+            )
+        }
+    }
+    if let Err(error) = crate::usage_overlay::save_settings(&s.codex_home, &settings) {
+        return err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SETTINGS",
+            &error,
+            None,
+        );
+    }
+    if body.action != "refresh" {
+        if let Err(error) = crate::usage_overlay::with_window(|window| {
+            crate::usage_overlay::apply_window_settings(window, &settings)
+        }) {
+            return err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_WINDOW", &error, None);
+        }
+    }
+    ok_env(json!({
+        "visible": settings.enabled,
+        "settings": serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
+    }))
 }
 
 async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
@@ -2500,6 +2901,45 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn path_needs_auth_covers_all_proxy_and_api_routes() {
+        // 代理前缀与具名代理路径必须全部要求鉴权(防漏配)
+        for path in [
+            "/api/providers",
+            "/api/desktop/host",
+            "/api/plugins/abc/invoke",
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1beta/models/generateContent",
+            "/anthropic/v1/messages",
+            "/hermes/chat/completions",
+            "/cursor/v1/chat/completions",
+            "/opencode/chat/completions",
+            "/openclaw/chat/completions",
+            "/grokbuild/chat/completions",
+            "/grok/v1/chat/completions",
+            "/workbuddy/chat/completions",
+            "/claude-desktop/v1/messages",
+            "/responses",
+            "/chat/completions",
+            "/images/generations",
+            "/models",
+        ] {
+            assert!(path_needs_auth(path), "{path} 应要求鉴权");
+        }
+        // 静态页面与健康检查不要求鉴权
+        for path in [
+            "/",
+            "/app.js",
+            "/styles.css",
+            "/api/bootstrap",
+            "/health",
+            "/media/x.png",
+        ] {
+            assert!(!path_needs_auth(path), "{path} 不应要求鉴权");
+        }
+    }
 
     fn dummy_state() -> AppState {
         AppState {

@@ -278,32 +278,37 @@ pub fn chat_json_to_gemini_json(model: &str, chat: &[u8]) -> Result<Vec<u8>, Str
 /// Chat SSE `delta` → Gemini SSE 分块(逐块即时投递,不缓冲;M3b 增量转换器同思路)。
 /// functionCall 的 args 跨块累积,完整后在 finish() 的终块一次性输出(与 Google 真实流式一致)。
 pub struct GeminiSseConvState {
-    buffer: String,
+    buffer: Vec<u8>,
     tools: Vec<(String, String, String)>, // (id, name, args 增量拼接)
     finish_reason: Option<String>,
     usage: Option<Value>,
     model: String,
+    request_id: String,
     saw_text: bool,
 }
 
 impl GeminiSseConvState {
     pub fn new() -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             tools: Vec::new(),
             finish_reason: None,
             usage: None,
             model: String::new(),
+            request_id: String::new(),
             saw_text: false,
         }
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        // 字节缓冲按 \n 取整行后再解码:多字节 UTF-8 被 TCP 分块切开时不会产生 U+FFFD
+        self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buffer.find('\n') {
-            let line = self.buffer[..pos].trim().to_string();
-            self.buffer = self.buffer[pos + 1..].to_string();
+        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buffer[..pos])
+                .trim()
+                .to_string();
+            self.buffer.drain(..=pos);
             if let Some(ev) = self.proc_line(&line) {
                 out.push(ev);
             }
@@ -341,12 +346,27 @@ impl GeminiSseConvState {
         out
     }
 
+    pub fn usage_snapshot(&self) -> Option<Value> {
+        self.usage.clone()
+    }
+
+    pub fn model_snapshot(&self) -> Option<String> {
+        (!self.model.is_empty()).then(|| self.model.clone())
+    }
+
+    pub fn request_id_snapshot(&self) -> Option<String> {
+        (!self.request_id.is_empty()).then(|| self.request_id.clone())
+    }
+
     fn proc_line(&mut self, line: &str) -> Option<String> {
         let p = line.strip_prefix("data:")?.trim();
         if p == "[DONE]" {
             return None;
         }
         let v: Value = serde_json::from_str(p).ok()?;
+        if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+            self.request_id = id.to_string();
+        }
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(u.clone());
         }
@@ -641,5 +661,20 @@ mod tests {
         let v2: Value = serde_json::from_slice(&out2).unwrap();
         assert_eq!(v2["error"]["message"], "upstream boom");
         assert_eq!(v2["error"]["status"], "INTERNAL");
+    }
+
+    /// 多字节 UTF-8 被 TCP 分块切开时,字节缓冲按整行解码,不得出现 U+FFFD。
+    #[test]
+    fn sse_feed_preserves_utf8_across_chunk_boundaries() {
+        let mut c = GeminiSseConvState::new();
+        // 「你好」= E4 BD A0 E5 A5 BD,在 E4 BD 之后切开喂入
+        let head =
+            b"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe4\xbd";
+        let tail = b"\xa0\xe5\xa5\xbd\"}}]}\n\n";
+        assert!(c.feed(head).is_empty(), "半行不应出块");
+        let evs = c.feed(tail);
+        assert_eq!(evs.len(), 1, "整行到齐应出一块:\n{evs:?}");
+        assert!(evs[0].contains("你好"), "UTF-8 拼接应无损:\n{:?}", evs);
+        assert!(!evs[0].contains('\u{fffd}'), "不得出现 U+FFFD:\n{:?}", evs);
     }
 }

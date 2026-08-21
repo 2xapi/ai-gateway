@@ -22,6 +22,10 @@ use crate::providers::AccessMode;
 use crate::server::AppState;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// 请求体上限(50MB,防超大请求拖垮本地网关)。
+const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
+/// 流式响应单 chunk 读超时:SSE 长会话不走总超时(120s 必截断),只要求每块有进展。
+const STREAM_CHUNK_TIMEOUT_SECS: u64 = 60;
 
 pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch(&s, req, "responses", "codex").await
@@ -78,7 +82,7 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
@@ -130,11 +134,20 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     };
     // 成功判定+单维实证标记(200 且 data[0] 有 b64_json/url → image_out=yes)
     let status = upstream.status();
-    let bytes = match upstream.bytes().await {
+    // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
+    if status.is_success() && is_html_upstream(&upstream) {
+        usage_log(&s, &provider, "images", usage_started, &send_meta, false);
+        s.keypool.mark_failure(&provider.id, &provider.api_key);
+        return err_resp(
+            StatusCode::BAD_GATEWAY,
+            "上游返回了网页而非图片接口,请检查供应商地址是否包含 /v1",
+        );
+    }
+    let bytes = match read_body_timed(upstream, timeout).await {
         Ok(b) => b,
         Err(e) => {
             usage_log(&s, &provider, "images", usage_started, &send_meta, false);
-            return err_resp(StatusCode::BAD_GATEWAY, &format!("读响应失败: {e}"));
+            return err_resp(StatusCode::BAD_GATEWAY, &e);
         }
     };
     let has_image = if status.is_success() {
@@ -159,8 +172,18 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
         &send_meta,
         status.is_success() && has_image,
     );
+    usage_log_response(
+        &s,
+        &provider,
+        "images",
+        usage_started,
+        &send_meta,
+        status.is_success(),
+        &bytes,
+    );
     if status.is_success() {
-        // 图片能力标签已停用：只记录请求结果，不写入能力标签。
+        // 图片能力标签已停用:只记录请求结果,不写入能力标签;成功清除 Key 冷却
+        s.keypool.mark_success(&provider.id);
     } else {
         s.keypool.mark_failure(&provider.id, &provider.api_key);
     }
@@ -397,11 +420,15 @@ async fn dispatch_anthropic_for(
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
     let body_bytes = rewrite_anthropic_request_model(agent, &provider, body_bytes);
+    let request_stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(|value| value.as_bool()))
+        .unwrap_or(false);
 
     let base = provider.base_url.trim_end_matches('/');
     let target = if base.ends_with("/v1") {
@@ -484,13 +511,34 @@ async fn dispatch_anthropic_for(
             resp = resp.header(axum::http::header::CONTENT_TYPE, hv);
         }
     }
-    let stream = upstream
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-    match resp.body(Body::from_stream(stream)) {
-        Ok(r) => r,
-        Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+    if !request_stream {
+        let bytes = match read_body_timed(upstream, timeout).await {
+            Ok(bytes) => bytes,
+            Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
+        };
+        usage_log_response(
+            state,
+            &provider,
+            "anthropic",
+            _usage_started,
+            &send_meta,
+            status.is_success(),
+            &bytes,
+        );
+        return resp
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"));
     }
+    let body = stream_body_with_usage(
+        upstream,
+        state,
+        &provider,
+        "anthropic",
+        _usage_started,
+        status.is_success(),
+    );
+    resp.body(body)
+        .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"))
 }
 
 fn rewrite_anthropic_request_model(
@@ -660,7 +708,7 @@ async fn dispatch_gemini(
     }
 
     let (_parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
@@ -742,13 +790,34 @@ async fn dispatch_gemini(
                     resp = resp.header(axum::http::header::CONTENT_TYPE, hv);
                 }
             }
-            let stream_out = upstream
-                .bytes_stream()
-                .map(|r| r.map_err(std::io::Error::other));
-            match resp.body(Body::from_stream(stream_out)) {
-                Ok(r) => r,
-                Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+            if !stream {
+                let bytes = match read_body_timed(upstream, timeout).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
+                };
+                usage_log_response(
+                    state,
+                    &provider,
+                    "gemini",
+                    usage_started,
+                    &send_meta,
+                    status.is_success(),
+                    &bytes,
+                );
+                return resp
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"));
             }
+            let body = stream_body_with_usage(
+                upstream,
+                state,
+                &provider,
+                "gemini",
+                usage_started,
+                status.is_success(),
+            );
+            resp.body(body)
+                .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"))
         }
         // ── 转换:Gemini → ChatCompletions(M3b 同思路)──
         crate::providers::WireApi::ChatCompletions => {
@@ -836,11 +905,9 @@ async fn dispatch_gemini(
             // 上游非成功:包装为 Gemini 错误形态(状态码透传)
             if !upstream.status().is_success() {
                 let st = upstream.status().as_u16();
-                let up_bytes = match upstream.bytes().await {
+                let up_bytes = match read_body_timed(upstream, timeout).await {
                     Ok(b) => b,
-                    Err(e) => {
-                        return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}"))
-                    }
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
                 };
                 let wrapped = crate::gateway_gemini_conv::chat_error_to_gemini(st, &up_bytes);
                 let status = StatusCode::from_u16(st).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -855,29 +922,48 @@ async fn dispatch_gemini(
                 // Chat SSE → Gemini SSE 逐块转换(不缓冲,M3b 增量思路)
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
                 let up_stream = upstream.bytes_stream();
+                let usage_home = state.codex_home.clone();
+                let usage_provider = provider.clone();
+                let usage_started_copy = usage_started;
                 tokio::spawn(async move {
                     let mut conv_state = crate::gateway_gemini_conv::GeminiSseConvState::new();
                     let mut s = up_stream;
-                    while let Some(chunk) = s.next().await {
+                    let mut stream_ok = true;
+                    'stream: while let Some(chunk) = next_stream_chunk(&mut s).await {
                         match chunk {
                             Ok(bytes) => {
                                 for out in conv_state.feed(&bytes) {
                                     if tx.send(Ok(out.into_bytes())).await.is_err() {
-                                        return;
+                                        stream_ok = false;
+                                        break 'stream;
                                     }
                                 }
                             }
                             Err(e) => {
+                                stream_ok = false;
                                 let _ = tx.send(Err(std::io::Error::other(e))).await;
-                                return;
+                                break;
                             }
                         }
                     }
-                    for out in conv_state.finish() {
-                        if tx.send(Ok(out.into_bytes())).await.is_err() {
-                            return;
+                    if stream_ok {
+                        for out in conv_state.finish() {
+                            if tx.send(Ok(out.into_bytes())).await.is_err() {
+                                stream_ok = false;
+                                break;
+                            }
                         }
                     }
+                    flush_stream_usage(
+                        &usage_home,
+                        &usage_provider,
+                        "chat_completions",
+                        usage_started_copy,
+                        stream_ok,
+                        conv_state.usage_snapshot(),
+                        conv_state.model_snapshot(),
+                        conv_state.request_id_snapshot(),
+                    );
                 });
                 Response::builder()
                     .status(StatusCode::OK)
@@ -887,12 +973,19 @@ async fn dispatch_gemini(
                     ))
                     .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build stream body"))
             } else {
-                let up_bytes = match upstream.bytes().await {
+                let up_bytes = match read_body_timed(upstream, timeout).await {
                     Ok(b) => b,
-                    Err(e) => {
-                        return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}"))
-                    }
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
                 };
+                usage_log_response(
+                    state,
+                    &provider,
+                    "gemini",
+                    usage_started,
+                    &send_meta,
+                    true,
+                    &up_bytes,
+                );
                 let converted = match crate::gateway_gemini_conv::chat_json_to_gemini_json(
                     upstream_model,
                     &up_bytes,
@@ -1002,7 +1095,7 @@ async fn dispatch(
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
@@ -1096,7 +1189,7 @@ async fn dispatch(
     {
         Ok(sent) => sent,
         Err((resp, meta)) => {
-            usage_log(state, &provider, "codex", _usage_started, &meta, false);
+            usage_log(state, &provider, agent, _usage_started, &meta, false);
             // Key 池打点:发送层失败(含超时)冷却当前 Key(单 Key 无池,打点为 no-op)
             state.keypool.mark_failure(&provider.id, &provider.api_key);
             return resp;
@@ -1104,14 +1197,14 @@ async fn dispatch(
     };
     // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
     if is_html_upstream(&upstream) {
-        usage_log(state, &provider, "codex", _usage_started, &send_meta, false);
+        usage_log(state, &provider, agent, _usage_started, &send_meta, false);
         return err_resp(StatusCode::BAD_GATEWAY, HTML_UPSTREAM_ERR);
     }
     // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
     usage_log(
         state,
         &provider,
-        "codex",
+        agent,
         _usage_started,
         &send_meta,
         upstream.status().is_success(),
@@ -1135,9 +1228,9 @@ async fn dispatch(
     if let Some(stream_flag) = conv_stream {
         let up_status = upstream.status();
         if !up_status.is_success() {
-            let up_bytes = match upstream.bytes().await {
+            let up_bytes = match read_body_timed(upstream, timeout).await {
                 Ok(b) => b,
-                Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+                Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
             };
             let st = StatusCode::from_u16(up_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             return Response::builder()
@@ -1150,29 +1243,48 @@ async fn dispatch(
             // ★ 增量流式转换：逐块 Chat SSE → 即时 Responses SSE（不缓冲，防 Codex 超时断连）
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
             let up_stream = upstream.bytes_stream();
+            let usage_home = state.codex_home.clone();
+            let usage_provider = provider.clone();
+            let usage_started = _usage_started;
             tokio::spawn(async move {
                 let mut conv = crate::gateway_conv::SseConvState::new();
                 let mut s = up_stream;
-                while let Some(chunk) = s.next().await {
+                let mut stream_ok = true;
+                'stream: while let Some(chunk) = next_stream_chunk(&mut s).await {
                     match chunk {
                         Ok(bytes) => {
                             for out in conv.feed(&bytes) {
                                 if tx.send(Ok(out.into_bytes())).await.is_err() {
-                                    return;
+                                    stream_ok = false;
+                                    break 'stream;
                                 }
                             }
                         }
                         Err(e) => {
+                            stream_ok = false;
                             let _ = tx.send(Err(std::io::Error::other(e))).await;
-                            return;
+                            break;
                         }
                     }
                 }
-                for out in conv.finish() {
-                    if tx.send(Ok(out.into_bytes())).await.is_err() {
-                        return;
+                if stream_ok {
+                    for out in conv.finish() {
+                        if tx.send(Ok(out.into_bytes())).await.is_err() {
+                            stream_ok = false;
+                            break;
+                        }
                     }
                 }
+                flush_stream_usage(
+                    &usage_home,
+                    &usage_provider,
+                    "chat_completions",
+                    usage_started,
+                    stream_ok,
+                    conv.usage_snapshot(),
+                    conv.model_snapshot(),
+                    conv.request_id_snapshot(),
+                );
             });
             return Response::builder()
                 .status(StatusCode::OK)
@@ -1182,10 +1294,19 @@ async fn dispatch(
                 ))
                 .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build stream body"));
         } else {
-            let up_bytes = match upstream.bytes().await {
+            let up_bytes = match read_body_timed(upstream, timeout).await {
                 Ok(b) => b,
-                Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+                Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
             };
+            usage_log_response(
+                state,
+                &provider,
+                "responses",
+                _usage_started,
+                &send_meta,
+                true,
+                &up_bytes,
+            );
             let converted = match crate::gateway_conv::chat_json_to_responses_json(&up_bytes) {
                 Ok(v) => v,
                 Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("resp conv: {e}")),
@@ -1207,19 +1328,50 @@ async fn dispatch(
             resp = resp.header(axum::http::header::CONTENT_TYPE, hv);
         }
     }
-    // 流式回传
-    let stream = upstream
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-    match resp.body(Body::from_stream(stream)) {
-        Ok(r) => r,
-        Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+    if !req_stream {
+        let bytes = match read_body_timed(upstream, timeout).await {
+            Ok(bytes) => bytes,
+            Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e),
+        };
+        usage_log_response(
+            state,
+            &provider,
+            &target_suffix,
+            _usage_started,
+            &send_meta,
+            status.is_success(),
+            &bytes,
+        );
+        return resp
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"));
     }
+    let protocol = if target_suffix == "chat/completions" {
+        "chat/completions"
+    } else {
+        "responses"
+    };
+    let body = stream_body_with_usage(
+        upstream,
+        state,
+        &provider,
+        protocol,
+        _usage_started,
+        status.is_success(),
+    );
+    resp.body(body)
+        .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build response body"))
 }
 
 fn build_client(provider: &crate::providers::Provider) -> Result<reqwest::Client, String> {
     let timeout = Duration::from_secs(provider.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let mut b = reqwest::Client::builder().timeout(timeout);
+    // 不设总超时(SSE 长会话必被 120s 截断):连接与单次读各自限时,流式路径再包 per-chunk timeout;
+    // 非流式路径由 read_body_timed 保留总超时语义
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        // 不跟随重定向:防止 https→http 降级时 Authorization 头被转发到异源
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(p) = provider.proxy_url.as_deref().filter(|s| !s.is_empty()) {
         match reqwest::Proxy::all(p) {
             Ok(px) => b = b.proxy(px),
@@ -1241,7 +1393,7 @@ const CRED_STALE_SECS: i64 = 12 * 3600;
 ///   无项但有 legacy → 保留共享凭证(老用户平滑);无项无 legacy → None(由凭证确保段尝试签发);
 /// - mode=off / 未命中 → 直连(None)。
 fn accel_plan(state: &AppState, base_url: &str, api_key: &str) -> Option<(AccLine, bool)> {
-    let cfg = state.accel.lock().unwrap();
+    let cfg = state.accel.lock().unwrap_or_else(|p| p.into_inner());
     match cfg.mode.as_str() {
         "custom" => {
             let endpoint = cfg.custom_node.trim();
@@ -1264,7 +1416,7 @@ fn accel_plan(state: &AppState, base_url: &str, api_key: &str) -> Option<(AccLin
         }
         "official" => {
             let line = {
-                let lines = state.health.lines.lock().unwrap();
+                let lines = state.health.lines.lock().unwrap_or_else(|p| p.into_inner());
                 crate::acclines::match_line_healthy(base_url, &lines, &state.health).cloned()
             };
             let mut line = line?;
@@ -1340,7 +1492,7 @@ async fn ensure_line_cred(
     api_key: &str,
 ) -> Option<(AccLine, bool)> {
     let mode = {
-        let cfg = state.accel.lock().unwrap();
+        let cfg = state.accel.lock().unwrap_or_else(|p| p.into_inner());
         cfg.mode.clone()
     };
     if mode != "official" || api_key.trim().is_empty() {
@@ -1368,7 +1520,7 @@ async fn ensure_line_cred(
     let base_line = match &line {
         Some((l, _)) => Some(l.clone()),
         None => {
-            let lines = state.health.lines.lock().unwrap();
+            let lines = state.health.lines.lock().unwrap_or_else(|p| p.into_inner());
             crate::acclines::match_line_healthy(base_url, &lines, &state.health).cloned()
         }
     };
@@ -1478,7 +1630,9 @@ fn build_line_client(line: &AccLine, timeout: Duration) -> Result<reqwest::Clien
         proxy
     };
     reqwest::Client::builder()
-        .timeout(timeout)
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .proxy(proxy)
         .build()
         .map_err(|e| format!("client: {e}"))
@@ -1516,6 +1670,291 @@ fn usage_log(
     );
 }
 
+fn usage_log_response(
+    state: &AppState,
+    provider: &crate::providers::Provider,
+    protocol: &str,
+    started: std::time::Instant,
+    meta: &SendMeta,
+    status_ok: bool,
+    body: &[u8],
+) {
+    if provider.access_mode == crate::providers::AccessMode::Official || !status_ok {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    let usage = crate::usage_stats::normalize_usage(protocol, &value);
+    if usage.input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.total_tokens.is_none()
+        && usage.cache_read_tokens.is_none()
+    {
+        return;
+    }
+    usage_log_value(
+        &state.codex_home,
+        provider,
+        protocol,
+        started,
+        status_ok,
+        value,
+    );
+    let _ = meta;
+}
+
+fn usage_log_value(
+    codex_home: &std::path::Path,
+    provider: &crate::providers::Provider,
+    protocol: &str,
+    started: std::time::Instant,
+    status_ok: bool,
+    value: serde_json::Value,
+) {
+    if provider.access_mode == crate::providers::AccessMode::Official {
+        return;
+    }
+    let usage = crate::usage_stats::normalize_usage(protocol, &value);
+    if usage.input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.total_tokens.is_none()
+        && usage.cache_read_tokens.is_none()
+    {
+        return;
+    }
+    crate::usage_stats::log_usage(
+        codex_home,
+        crate::usage_stats::UsageRecord {
+            kind: "usage".into(),
+            ts: chrono::Utc::now().timestamp(),
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            model: usage_model(&value),
+            route: protocol.to_string(),
+            request_id: usage_request_id(&value),
+            usage,
+            cost: None,
+            cost_source: None,
+            latency_ms: started.elapsed().as_millis() as u64,
+            ok: status_ok,
+        },
+    );
+}
+
+fn string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        value
+            .get(*name)
+            .and_then(|field| field.as_str())
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn usage_model(value: &serde_json::Value) -> Option<String> {
+    string_field(value, &["model", "modelVersion"])
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| string_field(response, &["model", "modelVersion"]))
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| string_field(message, &["model", "modelVersion"]))
+        })
+}
+
+fn usage_request_id(value: &serde_json::Value) -> Option<String> {
+    string_field(value, &["id"])
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| string_field(response, &["id"]))
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| string_field(message, &["id"]))
+        })
+}
+
+fn merge_usage(target: &mut Option<serde_json::Value>, value: &serde_json::Value) {
+    let Some(source) = value.as_object() else {
+        return;
+    };
+    let object = target.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(object) = object.as_object_mut() else {
+        return;
+    };
+    for (key, value) in source {
+        if !value.is_null() {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_stream_usage(
+    codex_home: &std::path::Path,
+    provider: &crate::providers::Provider,
+    protocol: &'static str,
+    started: std::time::Instant,
+    status_ok: bool,
+    usage: Option<serde_json::Value>,
+    model: Option<String>,
+    request_id: Option<String>,
+) {
+    if let Some(usage) = usage {
+        usage_log_value(
+            codex_home,
+            provider,
+            protocol,
+            started,
+            status_ok,
+            serde_json::json!({
+                "id": request_id,
+                "model": model,
+                "usage": usage,
+            }),
+        );
+    }
+}
+
+/// 非流式读完整响应体:保留总超时语义(客户端已不设总超时——流式路径按 chunk 限时,
+/// 非流式这里对整体读取包一层 tokio::time::timeout)。
+async fn read_body_timed(
+    upstream: reqwest::Response,
+    timeout: Duration,
+) -> Result<axum::body::Bytes, String> {
+    match tokio::time::timeout(timeout, upstream.bytes()).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(format!("read upstream: {e}")),
+        Err(_) => Err("read upstream: 读响应体超时".into()),
+    }
+}
+
+/// 流式单 chunk 读:包 tokio::time::timeout(每 chunk 60s)——SSE 长会话不被总超时截断,
+/// 死连接也不会无限挂起;超时/上游错误统一 Err(String),由调用方断流收束。
+async fn next_stream_chunk<S, E>(stream: &mut S) -> Option<Result<axum::body::Bytes, String>>
+where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(
+        Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
+        stream.next(),
+    )
+    .await
+    {
+        Ok(Some(Ok(bytes))) => Some(Ok(bytes)),
+        Ok(Some(Err(e))) => Some(Err(e.to_string())),
+        Ok(None) => None,
+        Err(_) => Some(Err(format!(
+            "读取上游流超时({STREAM_CHUNK_TIMEOUT_SECS}s 无数据)"
+        ))),
+    }
+}
+
+fn stream_body_with_usage(
+    upstream: reqwest::Response,
+    state: &AppState,
+    provider: &crate::providers::Provider,
+    protocol: &'static str,
+    started: std::time::Instant,
+    status_ok: bool,
+) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let usage_home = state.codex_home.clone();
+    let usage_provider = provider.clone();
+    tokio::spawn(async move {
+        let mut stream = upstream.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut usage = None;
+        let mut model = None;
+        let mut request_id = None;
+        let mut stream_ok = true;
+        'stream: while let Some(chunk) = next_stream_chunk(&mut stream).await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.extend_from_slice(&bytes);
+                    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let line = String::from_utf8_lossy(&buffer[..position])
+                            .trim()
+                            .to_string();
+                        buffer.drain(..=position);
+                        collect_stream_usage(&line, &mut usage, &mut model, &mut request_id);
+                    }
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        stream_ok = false;
+                        break 'stream;
+                    }
+                }
+                Err(error) => {
+                    stream_ok = false;
+                    let _ = tx.send(Err(std::io::Error::other(error))).await;
+                    break;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            let line = String::from_utf8_lossy(&buffer).trim().to_string();
+            collect_stream_usage(&line, &mut usage, &mut model, &mut request_id);
+        }
+        flush_stream_usage(
+            &usage_home,
+            &usage_provider,
+            protocol,
+            started,
+            status_ok && stream_ok,
+            usage,
+            model,
+            request_id,
+        );
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+fn collect_stream_usage(
+    line: &str,
+    usage: &mut Option<serde_json::Value>,
+    model: &mut Option<String>,
+    request_id: &mut Option<String>,
+) {
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return;
+    };
+    if data == "[DONE]" || data.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+    if let Some(value) = value.get("usage") {
+        merge_usage(usage, value);
+    }
+    if let Some(value) = value.get("usageMetadata") {
+        merge_usage(usage, value);
+    }
+    if let Some(value) = value.get("response").and_then(|v| v.get("usage")) {
+        merge_usage(usage, value);
+    }
+    if let Some(value) = value.get("response").and_then(|v| v.get("usageMetadata")) {
+        merge_usage(usage, value);
+    }
+    if let Some(value) = value.get("message").and_then(|v| v.get("usage")) {
+        merge_usage(usage, value);
+    }
+    if model.is_none() {
+        *model = usage_model(&value);
+    }
+    if request_id.is_none() {
+        *request_id = usage_request_id(&value);
+    }
+}
+
 /// 加速发送核心(R1 抽共用,dispatch 与 dispatch_anthropic 共享):
 /// 首发 = 命中线的 client(未命中/加速关 = 直连 client);Ok 但代理 407 或 Err 呈现代理
 /// 认证失败(CONNECT 阶段 407)→ 非 per-Key(legacy/custom)人话化 502 不绕线,per-Key 走
@@ -1548,8 +1987,9 @@ where
         degraded_to_direct: used_line,
     };
     let first = line_client.as_ref().unwrap_or(direct_client);
-    match build_rb(first).send().await {
-        Ok(r) => {
+    // send 只到响应头,不设总超时(SSE 流在 send 之后);但慢读上游可能让 send 无限挂起,包 60s 超时
+    match tokio::time::timeout(timeout, build_rb(first).send()).await {
+        Ok(Ok(r)) => {
             // 代理 407 → 线路凭证无效。per-Key 凭证走重签判别(星图 resolve_407:重签/降级/直连);
             // legacy/custom 凭证人话化 502,不换直连(避免绕过用户指定的线路)。
             if used_line && r.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
@@ -1564,7 +2004,7 @@ where
                 Ok((r, line_meta))
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             if used_line && proxy_auth_error(&e) {
                 // CONNECT 阶段的 407 以 Err(hyper ProxyAuthRequired) 形态出现:per-Key 同判别
                 if !per_key {
@@ -1577,16 +2017,23 @@ where
                     .await
             } else if used_line {
                 eprintln!("[GW] line 失败({e}),换直连重试一次");
-                match build_rb(direct_client).send().await {
-                    Ok(r) => Ok((r, direct_meta)),
-                    Err(e2) if e2.is_timeout() => Err((
+                match tokio::time::timeout(timeout, build_rb(direct_client).send()).await {
+                    Ok(Ok(r)) => Ok((r, direct_meta)),
+                    Ok(Err(e2)) if e2.is_timeout() => Err((
                         err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
                         direct_meta,
                     )),
-                    Err(e2) => {
+                    Ok(Err(e2)) => {
                         eprintln!("[GW] ✗ upstream ERR: {e2}");
                         Err((
                             err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"),
+                            direct_meta,
+                        ))
+                    }
+                    Err(_) => {
+                        eprintln!("[GW] send timeout (direct)");
+                        Err((
+                            err_resp(StatusCode::BAD_GATEWAY, "上游响应超时"),
                             direct_meta,
                         ))
                     }
@@ -1603,6 +2050,10 @@ where
                     direct_meta,
                 ))
             }
+        }
+        Err(_) => {
+            eprintln!("[GW] send timeout (first)");
+            Err((err_resp(StatusCode::BAD_GATEWAY, "上游响应超时"), line_meta))
         }
     }
 }
@@ -1642,26 +2093,30 @@ where
         degraded_to_direct: retry_line.is_none(),
     };
     let client = retry_line.as_ref().unwrap_or(direct_client);
-    match build_rb(client).send().await {
+    match tokio::time::timeout(timeout, build_rb(client).send()).await {
         // 重签凭证重试仍 407 → 人话化收束(不无限重试)
-        Ok(r2)
+        Ok(Ok(r2))
             if retry_line.is_some()
                 && r2.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
         {
             eprintln!("[GW] 重签后仍 407");
             Err((err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"), meta))
         }
-        Ok(r2) => Ok((r2, meta)),
-        Err(e2) if e2.is_timeout() => Err((
+        Ok(Ok(r2)) => Ok((r2, meta)),
+        Ok(Err(e2)) if e2.is_timeout() => Err((
             err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
             meta,
         )),
-        Err(e2) => {
+        Ok(Err(e2)) => {
             eprintln!("[GW] ✗ upstream ERR: {e2}");
             Err((
                 err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"),
                 meta,
             ))
+        }
+        Err(_) => {
+            eprintln!("[GW] send timeout (client)");
+            Err((err_resp(StatusCode::BAD_GATEWAY, "上游响应超时"), meta))
         }
     }
 }
@@ -1791,7 +2246,7 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn make_state(label: &str) -> (AppState, PathBuf, PathBuf) {
+    pub(crate) fn make_state(label: &str) -> (AppState, PathBuf, PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let root =
             std::env::temp_dir().join(format!("2xapi-m3-{label}-{}-{n}", std::process::id()));
@@ -1837,7 +2292,7 @@ mod tests {
         p.id
     }
 
-    fn claude_desktop_mapping_provider() -> crate::providers::Provider {
+    pub(crate) fn claude_desktop_mapping_provider() -> crate::providers::Provider {
         crate::providers::Provider {
             model: "fallback-model".into(),
             claude_desktop_model_routes: vec![
@@ -1897,6 +2352,44 @@ mod tests {
         assert_eq!(
             rewrite_anthropic_request_model("claude-desktop", &provider, unknown.clone()),
             unknown
+        );
+    }
+
+    #[test]
+    fn usage_stream_extracts_nested_response_identity_and_gemini_model_version() {
+        let mut usage = None;
+        let mut model = None;
+        let mut request_id = None;
+        collect_stream_usage(
+            r#"data: {"response":{"id":"resp-1","model":"gpt-responses","usage":{"input_tokens":8,"output_tokens":3}}}"#,
+            &mut usage,
+            &mut model,
+            &mut request_id,
+        );
+        assert_eq!(model.as_deref(), Some("gpt-responses"));
+        assert_eq!(request_id.as_deref(), Some("resp-1"));
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|value| value["input_tokens"].as_u64()),
+            Some(8)
+        );
+
+        let mut gemini_usage = None;
+        let mut gemini_model = None;
+        let mut gemini_request_id = None;
+        collect_stream_usage(
+            r#"data: {"modelVersion":"gemini-2.5-pro","usageMetadata":{"promptTokenCount":11}}"#,
+            &mut gemini_usage,
+            &mut gemini_model,
+            &mut gemini_request_id,
+        );
+        assert_eq!(gemini_model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(
+            gemini_usage
+                .as_ref()
+                .and_then(|value| value["promptTokenCount"].as_u64()),
+            Some(11)
         );
     }
 
@@ -4386,6 +4879,7 @@ mod tests {
 #[cfg(test)]
 mod verify_wb_path {
     use super::*;
+    use crate::gateway::tests::{claude_desktop_mapping_provider, make_state};
     use axum::routing::post;
     use axum::Router;
     use std::sync::{Arc, Mutex};
@@ -4475,6 +4969,32 @@ mod verify_wb_path {
             got,
             vec!["V1:/v1/chat/completions"],
             "应只命中 /v1 路径: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 用量台账 route 应透传调用方 agent 参数,而非硬编码 "codex"(多 agent 通路回归)。
+    #[test]
+    fn usage_log_route_comes_from_caller() {
+        let (state, _providers, root) = make_state("route");
+        let provider = claude_desktop_mapping_provider();
+        let meta = SendMeta {
+            line: "direct".into(),
+            degraded_to_direct: false,
+        };
+        usage_log(
+            &state,
+            &provider,
+            "hermes",
+            std::time::Instant::now(),
+            &meta,
+            true,
+        );
+        let raw = std::fs::read_to_string(state.codex_home.join("usage-stats.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(
+            line["route"], "hermes",
+            "台账 route 应为调用方 agent:\n{line}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::OnceLock;
 
 const MANAGEMENT_URL: &str = "https://2xapi.com/api/v1";
 const MANAGEMENT_FALLBACK: &str = "https://2xa.cc.cd/api/v1";
@@ -158,12 +159,17 @@ pub struct LoginResult {
     pub user: Value,
 }
 
-fn api_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .no_proxy()
-        .build()
-        .expect("failed to build HTTP client")
+fn api_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(12))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .no_proxy()
+            .build()
+            .expect("failed to build HTTP client")
+    })
 }
 
 async fn xapi_request(

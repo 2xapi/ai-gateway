@@ -305,8 +305,8 @@ fn host_of(base_url: &str) -> Option<String> {
     }
 }
 
-/// 单条 scope 匹配:host == scope、严格域后缀(api.2xa.cc.cd ⊃ 2xa.cc.cd)、
-/// 或子串匹配(任务书 §五 允许,如 "evil2xa.cc.cd.evil.com" 命中 "2xa.cc.cd")。
+/// 单条 scope 匹配:host == scope 或严格域后缀(api.2xa.cc.cd ⊃ 2xa.cc.cd)。
+/// 不做子串匹配,避免 "evil2xa.cc.cd.evil.com" 被 "2xa.cc.cd" 误命中。
 fn host_matches(host: &str, scope: &str) -> bool {
     let s = scope.trim().trim_start_matches('.').to_ascii_lowercase();
     if s.is_empty() {
@@ -315,7 +315,7 @@ fn host_matches(host: &str, scope: &str) -> bool {
     if s == "*" {
         return true; // 通用线:不限供应商
     }
-    host == s || host.ends_with(&format!(".{s}")) || host.contains(&s)
+    host == s || host.ends_with(&format!(".{s}"))
 }
 
 /// scope 匹配(纯函数):host 命中任一 line.scope 条目 → 返回 enabled 线中
@@ -392,7 +392,7 @@ impl HealthState {
 
     /// 整体替换线路集(远程 60min 刷新后调用)。
     pub fn set_lines(&self, lines: Vec<AccLine>) {
-        *self.lines.lock().unwrap() = lines;
+        *self.lines.lock().unwrap_or_else(|p| p.into_inner()) = lines;
     }
 
     /// 线路是否在服务中(未被摘除)。无记录视为健康(尚未探测不误伤)。
@@ -407,7 +407,12 @@ impl HealthState {
 
     /// 记录最近一次成功延迟(健康循环调用;apply_probe 只维护 fail/恢复计数)。
     fn record_latency(&self, line_id: &str, latency_ms: u64) {
-        if let Some(e) = self.table.lock().unwrap().get_mut(line_id) {
+        if let Some(e) = self
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(line_id)
+        {
             e.latency_ms = latency_ms;
         }
     }
@@ -444,7 +449,7 @@ fn probe_client() -> reqwest::Client {
 /// - ok → fails 归零(1 成恢复);
 /// - !ok → fails +1,连续 FAIL_THRESHOLD 次 → 摘除(is_available=false / is_unhealthy=true)。
 pub fn apply_probe(state: &HealthState, line_id: &str, ok: bool) {
-    let mut m = state.table.lock().unwrap();
+    let mut m = state.table.lock().unwrap_or_else(|p| p.into_inner());
     let e = m.entry(line_id.to_string()).or_insert(LineHealth {
         latency_ms: 0,
         fails: 0,
@@ -468,7 +473,7 @@ pub fn spawn_health_loop(state: Arc<HealthState>, interval: Duration) {
 /// 单轮探测+apply(循环体抽出,可测:测试可直接调用或用短 interval 的循环)。
 async fn health_cycle(state: &HealthState, client: &reqwest::Client) {
     let snapshot: Vec<AccLine> = {
-        let m = state.lines.lock().unwrap();
+        let m = state.lines.lock().unwrap_or_else(|p| p.into_inner());
         m.iter().filter(|l| l.enabled).cloned().collect()
     };
     if snapshot.is_empty() {
@@ -675,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn match_line_exact_and_substring_and_dot_scope() {
+    fn match_line_exact_and_dot_scope_without_substring() {
         let lines = vec![line("a", "http://x:1", &["2xa.cc.cd"], 1, true)];
         assert_eq!(
             match_line("https://2xa.cc.cd", &lines).unwrap().id,
@@ -683,11 +688,13 @@ mod tests {
             "完全相等"
         );
         assert_eq!(
-            match_line("https://evil2xa.cc.cd.evil.com", &lines)
-                .unwrap()
-                .id,
+            match_line("https://api.2xa.cc.cd", &lines).unwrap().id,
             "a",
-            "子串匹配"
+            "严格域后缀命中"
+        );
+        assert!(
+            match_line("https://evil2xa.cc.cd.evil.com", &lines).is_none(),
+            "仅包含子串(非精确、非域后缀)不命中"
         );
         // scope 带前导点也能匹配
         let dot = vec![line("b", "http://x:2", &[".2xa.cc.cd"], 1, true)];

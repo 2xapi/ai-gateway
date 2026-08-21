@@ -1927,6 +1927,7 @@ fn read_settings(codex_home: &Path) -> Value {
 }
 
 fn write_settings(codex_home: &Path, value: &Value) -> Result<(), String> {
+    // 调用方须已持有 settings_write_lock(与 usage_overlay 锁内 write_settings 一致),避免双重加锁
     let path = settings_path(codex_home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建设置目录失败: {error}"))?;
@@ -1951,6 +1952,8 @@ pub fn get_settings(codex_home: &Path) -> Value {
 }
 
 pub fn set_settings(codex_home: &Path, auto_repair: bool) -> Result<Value, String> {
+    // 读写在同一次锁内完成,避免与悬浮窗/加速配置并发保存互相覆盖段
+    let _save_guard = crate::usage_overlay::settings_write_lock()?;
     let mut settings = read_settings(codex_home);
     let object = settings
         .as_object_mut()

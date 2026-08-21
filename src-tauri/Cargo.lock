@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "console-2xapi"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "axum",
  "chrono",

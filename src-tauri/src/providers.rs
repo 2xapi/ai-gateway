@@ -735,12 +735,18 @@ pub fn public_provider(p: &Provider) -> Value {
     })
 }
 
+/// Key 脱敏:前 3 + … + 尾 4(与 server.rs/usage_stats.rs 同口径)。按 chars 而非
+/// 字节切片,多字节 UTF-8 Key(validate 不限制字符集)不会 panic;过短 Key 只留省略号。
 fn mask_key(key: &str) -> String {
-    if key.len() > 8 {
-        format!("{}...{}", &key[..5], &key[key.len() - 4..])
-    } else {
-        String::new()
+    let n = key.chars().count();
+    if n < 8 {
+        return "…".into();
     }
+    format!(
+        "{}…{}",
+        key.chars().take(3).collect::<String>(),
+        key.chars().skip(n - 4).collect::<String>()
+    )
 }
 
 fn io_errs(e: String) -> Vec<ValidationError> {
@@ -1644,6 +1650,14 @@ mod tests {
             0o600
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mask_key_is_utf8_safe_and_masks_middle() {
+        // 多字节 UTF-8 Key 不 panic(旧实现按字节切片会崩),前 3 + … + 尾 4 口径与 server.rs 一致
+        assert_eq!(mask_key("sk-密鑰密鑰密鑰密鑰"), "sk-…密鑰密鑰");
+        assert_eq!(mask_key("sk-abcdefghijkl"), "sk-…ijkl");
+        assert_eq!(mask_key("short"), "…");
     }
 
     #[test]

@@ -119,10 +119,31 @@ pub fn chat_json_to_responses_json(chat: &[u8]) -> Result<Vec<u8>, String> {
     resp.insert("model".into(), json!(model));
     resp.insert("error".into(), Value::Null);
     resp.insert("incomplete_details".into(), Value::Null);
-    resp.insert(
-        "output".into(),
-        json!([{ "type": "message", "id": format!("msg_{}", &id), "role": "assistant", "content": [{ "type": "output_text", "text": text }] }]),
-    );
+    let mut output: Vec<Value> = vec![
+        json!({ "type": "message", "id": format!("msg_{}", &id), "role": "assistant", "content": [{ "type": "output_text", "text": text }] }),
+    ];
+    // message.tool_calls → output 数组的 function_call 项(对齐 Responses API:call_id/name/arguments),
+    // 修复此前函数调用被静默丢弃
+    if let Some(tcs) = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+    {
+        for (i, tc) in tcs.iter().enumerate() {
+            let f = tc.get("function").cloned().unwrap_or(json!({}));
+            output.push(json!({
+                "type": "function_call",
+                "id": format!("fc_{}_{}", &id, i),
+                "call_id": tc.get("id").and_then(|x| x.as_str()).unwrap_or(""),
+                "name": f.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                "arguments": f.get("arguments").and_then(|x| x.as_str()).unwrap_or("{}"),
+                "status": "completed",
+            }));
+        }
+    }
+    resp.insert("output".into(), Value::Array(output));
     if let Some(u) = v.get("usage") {
         resp.insert("usage".into(), convert_usage(u));
     }
@@ -161,33 +182,51 @@ fn extract_text(content: Option<&Value>) -> String {
 }
 
 pub struct SseConvState {
-    buffer: String,
+    buffer: Vec<u8>,
     created: bool,
     item_added: bool,
     text: String,
     id: String,
+    usage_id: String,
     model: String,
     usage: Option<Value>,
+    tools: Vec<Option<ToolCallAcc>>, // 按 delta index 累积(function_call 增量)
+    tool_count: usize,
+}
+
+/// 流式 function_call 累积:字段与 Responses API 对齐(item id/call_id/name/arguments)。
+struct ToolCallAcc {
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    output_index: usize,
 }
 
 impl SseConvState {
     pub fn new() -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             created: false,
             item_added: false,
             text: String::new(),
-            id: "resp-conv".into(),
+            id: format!("resp_conv_{}", uuid::Uuid::new_v4().simple()),
+            usage_id: uuid::Uuid::new_v4().to_string(),
             model: String::new(),
             usage: None,
+            tools: Vec::new(),
+            tool_count: 0,
         }
     }
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        // 字节缓冲按 \n 取整行后再解码:多字节 UTF-8 被 TCP 分块切开时不会产生 U+FFFD
+        self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buffer.find('\n') {
-            let line = self.buffer[..pos].trim().to_string();
-            self.buffer = self.buffer[pos + 1..].to_string();
+        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buffer[..pos])
+                .trim()
+                .to_string();
+            self.buffer.drain(..=pos);
             self.proc(&line, &mut out);
         }
         out
@@ -195,20 +234,48 @@ impl SseConvState {
     pub fn finish(&mut self) -> Vec<String> {
         let mut out = self.feed(b"\n");
         let now = chrono::Utc::now().timestamp();
-        out.push(fmt(
-            "response.output_text.done",
-            &json!({"type":"response.output_text.done","text":self.text.clone()}),
-        ));
-        // 真机(codex 0.148)实测修复:delta 必须归属 active item,completed 的 usage 必须含
-        // input_tokens 等字段(空对象会被 Codex 判 parse 失败断流重试)
-        out.push(fmt("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"completed","content":[{"type":"output_text","text":self.text.clone()}]}})));
+        let mut output: Vec<Value> = Vec::new();
+        if self.item_added {
+            out.push(fmt(
+                "response.output_text.done",
+                &json!({"type":"response.output_text.done","text":self.text.clone()}),
+            ));
+            // 真机(codex 0.148)实测修复:delta 必须归属 active item,completed 的 usage 必须含
+            // input_tokens 等字段(空对象会被 Codex 判 parse 失败断流重试)
+            let message = json!({"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"completed","content":[{"type":"output_text","text":self.text.clone()}]});
+            output.push(message.clone());
+            out.push(fmt(
+                "response.output_item.done",
+                &json!({"type":"response.output_item.done","output_index":self.tool_count,"item":message}),
+            ));
+        }
+        // function_call 收尾:arguments.done + output_item.done,并进 completed 的 output
+        for slot in &self.tools {
+            let Some(acc) = slot else { continue };
+            out.push(fmt("response.function_call_arguments.done", &json!({"type":"response.function_call_arguments.done","item_id":acc.item_id,"output_index":acc.output_index,"arguments":acc.arguments})));
+            let item = json!({"id":acc.item_id,"type":"function_call","call_id":acc.call_id,"name":acc.name,"arguments":acc.arguments,"status":"completed"});
+            output.push(item.clone());
+            out.push(fmt("response.output_item.done", &json!({"type":"response.output_item.done","output_index":acc.output_index,"item":item})));
+        }
         out.push(fmt("response.completed", &json!({"type":"response.completed","response":{
             "id":self.id.clone(),"object":"response","created_at":now,"model":self.model.clone(),"status":"completed",
-            "output":[{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","content":[{"type":"output_text","text":self.text.clone()}]}],
+            "output":output,
             "usage":self.usage.as_ref().map(convert_usage).unwrap_or_else(zero_usage),
             "incomplete_details":null
         }})));
         out
+    }
+
+    pub fn usage_snapshot(&self) -> Option<Value> {
+        self.usage.clone()
+    }
+
+    pub fn model_snapshot(&self) -> Option<String> {
+        (!self.model.is_empty()).then(|| self.model.clone())
+    }
+
+    pub fn request_id_snapshot(&self) -> Option<String> {
+        (!self.usage_id.is_empty()).then(|| self.usage_id.clone())
     }
     fn proc(&mut self, line: &str, out: &mut Vec<String>) {
         let p = match line.strip_prefix("data:") {
@@ -225,11 +292,20 @@ impl SseConvState {
         if let Some(u) = v.get("usage") {
             self.usage = Some(u.clone());
         }
-        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+        if let Some(m) = v
+            .get("model")
+            .or_else(|| v.get("modelVersion"))
+            .or_else(|| v.get("response").and_then(|response| response.get("model")))
+            .and_then(|x| x.as_str())
+        {
             self.model = m.to_string();
         }
         if !self.created {
-            if let Some(i) = v.get("id").and_then(|x| x.as_str()) {
+            if let Some(i) = v
+                .get("id")
+                .or_else(|| v.get("response").and_then(|response| response.get("id")))
+                .and_then(|x| x.as_str())
+            {
                 self.id = i.to_string();
             }
             out.push(fmt("response.created", &json!({"type":"response.created","response":{"id":self.id.clone(),"object":"response","status":"in_progress","output":[]}})));
@@ -243,7 +319,8 @@ impl SseConvState {
             .and_then(|c| c.as_str())
         {
             if !self.item_added {
-                out.push(fmt("response.output_item.added", &json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"in_progress","content":[]}})));
+                // output_index 按实际输出顺序:tool 已先发则 message 排在其后,避免与 tool 同 index 冲突
+                out.push(fmt("response.output_item.added", &json!({"type":"response.output_item.added","output_index":self.tool_count,"item":{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"in_progress","content":[]}})));
                 self.item_added = true;
             }
             self.text.push_str(ch);
@@ -251,6 +328,64 @@ impl SseConvState {
                 "response.output_text.delta",
                 &json!({"type":"response.output_text.delta","delta":ch}),
             ));
+        }
+        // delta.tool_calls → function_call 输出项(对齐 Responses API:item id/call_id/name/arguments)
+        if let Some(tcs) = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"))
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                while self.tools.len() <= idx {
+                    self.tools.push(None);
+                }
+                let f = tc.get("function").cloned().unwrap_or(json!({}));
+                let name = f
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let arguments = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                let call_id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if self.tools[idx].is_none() {
+                    self.tool_count += 1;
+                    let item_id = format!("fc_{}_{}", self.id, self.tool_count);
+                    let output_index = (if self.item_added { 1 } else { 0 }) + self.tool_count - 1;
+                    self.tools[idx] = Some(ToolCallAcc {
+                        item_id: item_id.clone(),
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
+                        output_index,
+                    });
+                    out.push(fmt("response.output_item.added", &json!({"type":"response.output_item.added","output_index":output_index,"item":{"id":item_id,"type":"function_call","call_id":call_id,"name":name,"arguments":"","status":"in_progress"}})));
+                }
+                let acc = self.tools[idx].as_mut().expect("just inserted");
+                if !call_id.is_empty() {
+                    acc.call_id = call_id;
+                }
+                if !name.is_empty() {
+                    acc.name = name;
+                }
+                if !arguments.is_empty() {
+                    // 规范上游按增量块发 arguments;个别上游每块重发完整 JSON 对象,
+                    // 拼接会得到非法 JSON——识别完整对象时整体替换
+                    let trimmed = arguments.trim();
+                    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                        acc.arguments = arguments.to_string();
+                    } else {
+                        acc.arguments.push_str(arguments);
+                    }
+                    out.push(fmt("response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","item_id":acc.item_id,"output_index":acc.output_index,"delta":arguments})));
+                }
+            }
         }
     }
 }
@@ -398,5 +533,95 @@ mod tests {
             f2.contains(r#""input_tokens":7"#) && f2.contains(r#""total_tokens":10"#),
             "上游 usage 应转换:\n{f2}"
         );
+    }
+
+    #[test]
+    fn usage_ids_stay_unique_when_upstream_reuses_response_id() {
+        let chunk = b"data: {\"id\":\"reused\",\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+        let mut first = SseConvState::new();
+        let mut second = SseConvState::new();
+        first.feed(chunk);
+        second.feed(chunk);
+        assert_ne!(first.request_id_snapshot(), second.request_id_snapshot());
+    }
+
+    #[test]
+    fn generated_response_ids_are_unique_per_stream() {
+        let first = SseConvState::new().request_id_snapshot();
+        let second = SseConvState::new().request_id_snapshot();
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert_ne!(first, second);
+    }
+
+    /// 多字节 UTF-8 被 TCP 分块切开时,字节缓冲按整行解码,不得出现 U+FFFD。
+    #[test]
+    fn sse_feed_preserves_utf8_across_chunk_boundaries() {
+        let mut c = SseConvState::new();
+        // 「你好」= E4 BD A0 E5 A5 BD,在 E4 BD 之后切开喂入
+        let head = b"data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe4\xbd";
+        let tail = b"\xa0\xe5\xa5\xbd\"}}]}\n\n";
+        assert!(c.feed(head).is_empty(), "半行不应出事件");
+        let evs = c.feed(tail);
+        let joined = evs.join("");
+        assert!(joined.contains("你好"), "UTF-8 拼接应无损:\n{joined}");
+        assert!(!joined.contains('\u{fffd}'), "不得出现 U+FFFD:\n{joined}");
+    }
+
+    /// 非流式:chat message.tool_calls → responses output 的 function_call 项。
+    #[test]
+    fn converts_nonstream_tool_calls_to_function_call_output() {
+        let chat = r#"{"id":"chat-2","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_42","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+        let out = chat_json_to_responses_json(chat.as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["status"], "completed");
+        let fc = &v["output"][1];
+        assert_eq!(fc["type"], "function_call");
+        assert_eq!(fc["call_id"], "call_42");
+        assert_eq!(fc["name"], "get_weather");
+        assert_eq!(fc["arguments"], r#"{"city":"北京"}"#);
+        assert_eq!(fc["status"], "completed");
+        assert!(fc["id"].as_str().unwrap().starts_with("fc_"));
+    }
+
+    /// 流式:delta.tool_calls → output_item.added(function_call) + function_call_arguments.delta,
+    /// 收尾 arguments.done / output_item.done,completed 的 output 含 function_call 条目。
+    #[test]
+    fn sse_tool_calls_map_to_function_call_events() {
+        let mk = |d: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({ "id": "chatcmpl-9", "choices": [{ "index": 0, "delta": d }] })
+            )
+        };
+        let mut c = SseConvState::new();
+        let e1 = c.feed(
+            mk(json!({ "tool_calls": [{ "index": 0, "id": "call_42", "type": "function", "function": { "name": "get_weather", "arguments": "{\"ci" } }] }))
+                .as_bytes(),
+        );
+        assert_eq!(e1.len(), 3, "created + item.added + args.delta:\n{e1:?}");
+        let joined1 = e1.join("");
+        assert!(joined1.contains("event: response.output_item.added"));
+        assert!(joined1.contains(r#""type":"function_call""#));
+        assert!(joined1.contains(r#""call_id":"call_42""#));
+        assert!(joined1.contains(r#""name":"get_weather""#));
+        assert!(joined1.contains("event: response.function_call_arguments.delta"));
+        assert!(joined1.contains(r#""delta":"{\"ci""#));
+
+        let e2 = c.feed(
+            mk(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "ty\":\"北京\"}" } }] }))
+                .as_bytes(),
+        );
+        assert_eq!(e2.len(), 1, "后续块只出 args.delta:\n{e2:?}");
+
+        let done = c.finish().join("");
+        assert!(
+            done.contains("event: response.function_call_arguments.done"),
+            "缺 arguments.done:\n{done}"
+        );
+        assert!(done.contains(r#""arguments":"{\"city\":\"北京\"}""#));
+        assert!(done.contains("event: response.output_item.done"));
+        assert!(done.contains(r#""type":"function_call""#));
+        assert!(done.contains(r#""status":"completed""#));
     }
 }
