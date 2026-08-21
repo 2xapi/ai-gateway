@@ -63,7 +63,13 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: cargo tauri build --target ${{ matrix.target }}
+        run: |
+          # secrets 未配置时 APPLE_* 为空字符串,tauri-bundler 会把空值当作"已提供"并尝试导入空证书;
+          # 显式 unset,让 bundler 走"未配置→不签名"路径
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          cargo tauri build --target ${{ matrix.target }}
       - name: Normalize release assets
         env:
           TARGET: ${{ matrix.target }}
