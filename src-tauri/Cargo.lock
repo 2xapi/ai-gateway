@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "console-2xapi"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "axum",
  "chrono",
@@ -471,9 +471,11 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tower",
  "tower-http",
  "uuid",

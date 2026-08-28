@@ -11,7 +11,7 @@
 <body>
 <div id="app">
   <header class="topbar">
-    <span class="brand-logo"><img src="brand-logo.svg" alt="2xapi"></span><span class="brand">2xapi Console</span><span class="app-version-badge" id="appVersionBadge">v1.0.13</span>
+    <span class="brand-logo"><img src="brand-logo.svg" alt="2xapi"></span><span class="brand">2xapi Console</span><span class="app-version-badge" id="appVersionBadge">v1.0.14</span>
     <span class="spacer"></span>
     <span class="chip" id="gwChip"><span class="led"></span>gateway 127.0.0.1:8787</span>
     <span class="chip"><b id="hostChip">未托管</b></span>
@@ -72,6 +72,10 @@
     <div class="box-body no-bar">
       <div class="grid2">
         <div class="f" style="grid-column:1/-1"><label>名称 *</label><input id="eName"></div>
+        <div class="f" style="grid-column:1/-1" id="eModeWrap"><label>接入模式</label><select id="eMode">
+          <option value="mixed">保持官方登录 + 第三方混合 (Mixed)</option>
+          <option value="pure_api">纯第三方 API (Pure API)</option>
+        </select><div class="sub">Mixed 会保留 Codex 官方 OAuth/keyring，只把第三方请求交给本地网关；不会把中转 Key 写入 auth.json。</div></div>
         <div class="f" style="grid-column:1/-1"><label>上游地址 *</label><input class="mono" id="eUrl"></div>
         <div class="f" style="grid-column:1/-1"><label>api key · 留空不修改</label><input type="password" class="mono" id="eKey" placeholder="sk-..."></div>
         <div class="f"><label>默认模型 *</label><input class="mono" id="eModel" placeholder="点「拉取模型」后自动填入"></div>
@@ -100,7 +104,7 @@
       </section>
       <table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody id="modelRows"></tbody></table>
       <div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="mfetch">⤓ 拉取模型</button><button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button></div>
-      <details style="margin-top:8px"><summary class="eyebrow" style="cursor:pointer">高级(代理 · 超时 · 备注)· 不用动</summary><div class="sub" style="margin-top:6px">协议默认自动(拉取模型时探测回写);上游兼容 Responses / ChatCompletions 时网关自动转换;Messages 供 Claude 供应商使用。</div></details>
+      <details style="margin-top:8px"><summary class="eyebrow" style="cursor:pointer">高级(供应商独立代理 · 超时 · 备注)</summary><div class="grid2" style="margin-top:8px"><div class="f"><label>供应商独立 IP/HTTP 代理</label><input class="mono" id="eProxy" placeholder="http://127.0.0.1:7890"><div class="sub">只影响该供应商的上游请求；支持 HTTP(S)/SOCKS5，留空直连。</div></div><div class="f"><label>上游超时(秒)</label><input class="mono" id="eTimeout" type="number" min="5" max="3600" placeholder="默认 120"></div></div><div class="sub" style="margin-top:6px">协议默认自动(拉取模型时探测回写);上游兼容 Responses / ChatCompletions 时网关自动转换;Messages 供 Claude 供应商使用。</div></details>
     </div>
     <div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="edit-save">保存</button><button class="btn ghost" data-a="close-edit">取消</button></div>
   </div>
