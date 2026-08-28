@@ -4,7 +4,7 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -14,6 +14,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
@@ -315,6 +316,17 @@ pub fn build_router(state: AppState) -> Router {
             "/api/providers/:id",
             put(handle_providers_update).delete(handle_providers_delete),
         )
+        // --- P0 配置档案（只保存路由元数据，不保存凭据）---
+        .route(
+            "/api/profiles",
+            get(handle_profiles_list).post(handle_profiles_create),
+        )
+        .route("/api/profiles/preview", post(handle_profiles_preview))
+        .route("/api/profiles/apply", post(handle_profiles_apply))
+        .route(
+            "/api/profiles/:id",
+            put(handle_profiles_update).delete(handle_profiles_delete),
+        )
         // --- Codex 启动器（M7，直连版）---
         .route("/api/launcher/preflight", post(handle_launcher_preflight))
         .route("/api/launcher/start", post(handle_launcher_start))
@@ -324,6 +336,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/desktop/state", get(handle_desktop_state))
         .route("/api/desktop/host", post(handle_desktop_host))
         .route("/api/desktop/unhost", post(handle_desktop_unhost))
+        .route(
+            "/api/desktop/recovery/preview",
+            get(handle_desktop_recovery_preview_get).post(handle_desktop_recovery_preview),
+        )
+        .route(
+            "/api/desktop/recovery/apply",
+            post(handle_desktop_recovery_apply),
+        )
+        .route(
+            "/api/desktop/login/status",
+            get(handle_desktop_login_status),
+        )
+        .route("/api/desktop/login/start", post(handle_desktop_login_start))
         // --- Claude Code 配置托管与裸 CLI 启动 ---
         .route(
             "/api/desktop/claude-start",
@@ -370,8 +395,20 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/sessions", get(handle_sessions_list))
         .route("/api/sessions/inspect", get(handle_sessions_inspect))
+        .route(
+            "/api/sessions/repair/preview",
+            post(handle_sessions_repair_preview),
+        )
         .route("/api/sessions/repair", post(handle_sessions_repair))
         .route("/api/sessions/jobs/:id", get(handle_sessions_job))
+        .route(
+            "/api/sessions/jobs/:id/cancel",
+            post(handle_sessions_job_cancel),
+        )
+        .route(
+            "/api/sessions/jobs/:id/resume",
+            post(handle_sessions_job_resume),
+        )
         .route(
             "/api/sessions/delete-preview",
             post(handle_sessions_delete_preview),
@@ -411,7 +448,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/media/:file", get(crate::media::handle_serve))
         .route(
             "/api/media",
-            get(crate::media::handle_list).post(crate::media::handle_upload),
+            get(crate::media::handle_list)
+                .post(crate::media::handle_upload)
+                // data_b64 比原始媒体膨胀约 4/3；媒体模块自身仍按 MIME 限制解码后大小。
+                .layer(DefaultBodyLimit::max(140 * 1024 * 1024)),
         )
         .route("/api/media/:id", delete(crate::media::handle_delete))
         // 用量仪表盘(竞品吸收项):按 provider 聚合 P50/P90/请求量/成功率
@@ -560,14 +600,14 @@ async fn handle_health(State(s): State<Arc<AppState>>) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("openai");
     let model = cfg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let auth_exists = s.codex_home.join("auth.json").exists();
+    let login = crate::codex_security::probe_login_cached(&s.codex_home);
     ok_json(json!({
         "ok": true,
         "provider": { "providerId": provider },
         "model": model,
         "configPath": s.config_path.to_string_lossy(),
         "codexHome": s.codex_home.to_string_lossy(),
-        "officialAuthPresent": auth_exists,
+        "login": login,
     }))
 }
 
@@ -683,10 +723,10 @@ async fn handle_auth_login(State(s): State<Arc<AppState>>, Json(body): Json<Valu
         return err_json(StatusCode::BAD_REQUEST, "邮箱和密码不能为空");
     }
     match crate::auth::login(email, password, ticket, randstr).await {
-        Ok(result) => {
-            crate::auth::save_session(&s.codex_home, &result, remember);
-            ok_json(json!({ "authenticated": true, "user": result.user }))
-        }
+        Ok(result) => match crate::auth::save_session(&s.codex_home, &result, remember) {
+            Ok(()) => ok_json(json!({ "authenticated": true, "user": result.user })),
+            Err(error) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        },
         Err(e) => err_json(StatusCode::UNAUTHORIZED, &format!("登录失败: {}", e)),
     }
 }
@@ -706,8 +746,10 @@ async fn handle_auth_remembered(State(s): State<Arc<AppState>>) -> Response {
 async fn handle_auth_remember(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let email = body.get("email").and_then(|v| v.as_str()).unwrap_or("");
     let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    crate::auth::save_remembered(&s.codex_home, email, password);
-    ok_json(json!({ "ok": true }))
+    match crate::auth::save_remembered(&s.codex_home, email, password) {
+        Ok(()) => ok_json(json!({ "ok": true })),
+        Err(error) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    }
 }
 
 async fn handle_auth_forget(State(s): State<Arc<AppState>>) -> Response {
@@ -813,8 +855,48 @@ async fn handle_providers_update(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let input = crate::providers::value_to_input(&body);
-    match crate::providers::update(&s.providers_path, &id, input) {
+    // PUT 可能来自旧版前端，仅提交了少量字段。数据层按字段保留未提交值，
+    // 并在当前 Codex 托管该供应商时立即重应用 config/catalog，避免磁盘配置滞后。
+    let hosted_codex = crate::desktop::detect_hosting(&s.config_path, &s.providers_path)
+        .get("way")
+        .and_then(Value::as_str)
+        == Some("gateway");
+    let active_codex = crate::providers::get_active_for_agent(&s.providers_path, "codex")
+        .is_some_and(|provider| provider.id == id);
+    let snapshot = if hosted_codex && active_codex {
+        match crate::desktop::snapshot_file(&s.providers_path) {
+            Ok(value) => Some(value),
+            Err((_, _, message)) => {
+                return err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_IO", &message, None)
+            }
+        }
+    } else {
+        None
+    };
+    match crate::providers::update_from_value(&s.providers_path, &id, &body) {
+        Ok(p) if hosted_codex && active_codex && p.agent == "codex" => {
+            match crate::desktop::host(
+                &s.config_path,
+                &s.backup_dir,
+                &s.codex_home,
+                &s.providers_path,
+                &id,
+                "gateway",
+            ) {
+                Ok(_) => ok_env(crate::providers::public_provider(&p)),
+                Err((status, code, message)) => {
+                    if let Some(snapshot) = snapshot.as_ref() {
+                        let _ = crate::desktop::restore_file_snapshot(&s.providers_path, snapshot);
+                    }
+                    err_env(
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                        &code,
+                        &message,
+                        None,
+                    )
+                }
+            }
+        }
         Ok(p) => ok_env(crate::providers::public_provider(&p)),
         Err(errs) => {
             if errs.len() == 1 && errs[0].field == "id" {
@@ -900,8 +982,18 @@ async fn handle_providers_delete(
             None,
         );
     }
-    crate::providers::delete(&s.providers_path, &id);
-    ok_env(json!({ "id": id, "deleted": true }))
+    match crate::providers::delete_checked(&s.providers_path, &id) {
+        Ok(()) => ok_env(json!({ "id": id, "deleted": true })),
+        Err(error) if error == "供应商不存在" => {
+            err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", &error, None)
+        }
+        Err(error) => err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_PROVIDER_WRITE",
+            &error,
+            None,
+        ),
+    }
 }
 
 // PUT /api/providers/reorder { ids }
@@ -918,8 +1010,15 @@ async fn handle_providers_reorder(
                 .collect()
         })
         .unwrap_or_default();
-    crate::providers::reorder(&s.providers_path, &ids);
-    ok_env(json!({ "reordered": true, "count": ids.len() }))
+    match crate::providers::reorder_checked(&s.providers_path, &ids) {
+        Ok(()) => ok_env(json!({ "reordered": true, "count": ids.len() })),
+        Err(error) => err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_PROVIDER_WRITE",
+            &error,
+            None,
+        ),
+    }
 }
 
 // GET /api/providers/active
@@ -932,51 +1031,25 @@ async fn handle_providers_active(State(s): State<Arc<AppState>>) -> Response {
 
 // POST /api/providers/activate { id }
 async fn handle_providers_activate(
-    State(s): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    State(_s): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if id.is_empty() {
-        return err_env(StatusCode::BAD_REQUEST, "E_BAD_REQUEST", "缺少 id", None);
-    }
-    match crate::config::activate(
-        &s.config_path,
-        &s.backup_dir,
-        &s.providers_path,
-        &s.codex_home,
-        id,
-    ) {
-        Ok(r) => ok_env(json!({
-            "active_provider_id": r.active_provider_id,
-            "config_written": r.config_written,
-            "auth_changed": r.auth_changed,
-            "backup_created": r.backup_created,
-        })),
-        Err(e) => {
-            if e.contains("不存在") {
-                err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", &e, None)
-            } else {
-                err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL", &e, None)
-            }
-        }
-    }
+    err_env(
+        StatusCode::GONE,
+        "E_CODEX_CONFIG_MUTATION_RETIRED",
+        "Codex 旧版 activate 会改写官方凭据，已停用；请使用 /api/desktop/host 的 gateway 模式",
+        None,
+    )
 }
 
 // POST /api/providers/activate-official
-async fn handle_providers_activate_official(State(s): State<Arc<AppState>>) -> Response {
-    match crate::config::activate_official(
-        &s.config_path,
-        &s.backup_dir,
-        &s.providers_path,
-        &s.codex_home,
-    ) {
-        Ok(r) => ok_env(json!({
-            "active_provider_id": Value::Null,
-            "config_written": r.config_written,
-            "auth_restored": r.auth_restored,
-        })),
-        Err(e) => err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL", &e, None),
-    }
+async fn handle_providers_activate_official(State(_s): State<Arc<AppState>>) -> Response {
+    err_env(
+        StatusCode::GONE,
+        "E_CODEX_CONFIG_MUTATION_RETIRED",
+        "Codex 旧版 activate-official 会回灌 auth.json，已停用；请使用官方恢复预览与二次确认流程",
+        None,
+    )
 }
 
 // POST /api/providers/preview-config { id? 或临时 provider 对象 }
@@ -1000,6 +1073,26 @@ async fn handle_providers_preview(
     } else {
         crate::providers::input_to_provider(crate::providers::value_to_input(&body))
     };
+    if provider.agent == "codex" {
+        let fingerprint =
+            crate::codex_overlay::fingerprint(&s.config_path).map_err(|error| error.to_string());
+        return match fingerprint {
+            Ok(fingerprint) => ok_env(json!({
+                "mode": "gateway",
+                "config": fingerprint,
+                "auth_action": "noop",
+                "auth_diff": Value::Null,
+                "backup_will_create": false,
+                "warning": "Codex 官方凭据由 CLI/keyring 管理，预览不会读取或改写 auth.json",
+            })),
+            Err(error) => err_env(
+                StatusCode::BAD_REQUEST,
+                "E_CODEX_CONFIG_PARSE",
+                &error,
+                None,
+            ),
+        };
+    }
     match crate::config::preview_provider(&s.config_path, &s.codex_home, &provider) {
         Ok(o) => ok_env(json!({
             "config_toml": o.config_toml,
@@ -1112,6 +1205,136 @@ async fn handle_providers_diagnose(
     };
     let result = crate::diagnose::diagnose(&provider).await;
     ok_env(serde_json::to_value(&result).unwrap_or(json!({})))
+}
+
+// ── P0 配置档案 ─────────────────────────────────────────────
+
+async fn handle_profiles_list(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let agent = query.get("agent").map(String::as_str);
+    let data = crate::profiles::list(&s.codex_home.join("2xapi-profiles.json"), agent);
+    ok_env(json!({
+        "profiles": data.profiles,
+        "activeProfiles": data.active_profiles,
+        "activeProfileId": data.active_profiles.get(agent.unwrap_or("codex")),
+    }))
+}
+
+async fn handle_profiles_create(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let provider_id = body
+        .get("providerId")
+        .or_else(|| body.get("provider_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !crate::providers::load(&s.providers_path)
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id)
+    {
+        return err_env(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "E_PROFILE_PROVIDER_NOT_FOUND",
+            "profile 引用的供应商不存在",
+            None,
+        );
+    }
+    match crate::profiles::create(&s.codex_home.join("2xapi-profiles.json"), &body) {
+        Ok(profile) => ok_env(json!({ "profile": profile })),
+        Err(error) => err_env(StatusCode::UNPROCESSABLE_ENTITY, "E_PROFILE", &error, None),
+    }
+}
+
+async fn handle_profiles_update(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let provider_id = body
+        .get("providerId")
+        .or_else(|| body.get("provider_id"))
+        .and_then(Value::as_str);
+    if let Some(provider_id) = provider_id {
+        if !crate::providers::load(&s.providers_path)
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return err_env(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "E_PROFILE_PROVIDER_NOT_FOUND",
+                "profile 引用的供应商不存在",
+                None,
+            );
+        }
+    }
+    match crate::profiles::update(&s.codex_home.join("2xapi-profiles.json"), &id, &body) {
+        Ok(profile) => ok_env(json!({ "profile": profile })),
+        Err(error) => err_env(StatusCode::UNPROCESSABLE_ENTITY, "E_PROFILE", &error, None),
+    }
+}
+
+async fn handle_profiles_delete(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::profiles::delete(&s.codex_home.join("2xapi-profiles.json"), &id) {
+        Ok(()) => ok_env(json!({ "deleted": true })),
+        Err(error) => err_env(StatusCode::NOT_FOUND, "E_PROFILE_NOT_FOUND", &error, None),
+    }
+}
+
+async fn handle_profiles_preview(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    match crate::profiles::preview(&s.codex_home, &s.config_path, &s.providers_path, &body) {
+        Ok(result) => ok_env(result),
+        Err(error) => err_env(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "E_PROFILE_PREVIEW",
+            &error,
+            None,
+        ),
+    }
+}
+
+async fn handle_profiles_apply(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    let token = body
+        .get("previewToken")
+        .or_else(|| body.get("preview_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let confirmed = body
+        .get("confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match crate::profiles::apply(
+        &s.codex_home,
+        &s.config_path,
+        &s.backup_dir,
+        &s.providers_path,
+        id,
+        token,
+        confirmed,
+    ) {
+        Ok(result) => ok_env(result),
+        Err((status, code, message)) => err_env(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            &code,
+            &message,
+            None,
+        ),
+    }
 }
 
 // --- Backups & history ---
@@ -1891,6 +2114,26 @@ async fn handle_sessions_inspect(State(s): State<Arc<AppState>>) -> Response {
     ok_env(crate::sessions::inspect_sessions(&s.codex_home))
 }
 
+async fn handle_sessions_repair_preview(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let target = body
+        .get("targetProvider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match crate::sessions::preview_repair(&s.codex_home, target) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(
+            StatusCode::BAD_REQUEST,
+            "E_SESSION_REPAIR_PREVIEW",
+            &error,
+            None,
+        ),
+    }
+}
+
 async fn handle_sessions_repair(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1900,6 +2143,16 @@ async fn handle_sessions_repair(
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    if let Some(token) = body.get("previewToken").and_then(Value::as_str) {
+        if let Err(error) = crate::sessions::validate_repair_preview(target, token) {
+            return err_env(
+                StatusCode::CONFLICT,
+                "E_SESSION_REPAIR_PREVIEW",
+                &error,
+                None,
+            );
+        }
+    }
     match crate::sessions::start_repair_job(
         s.codex_home.clone(),
         s.backup_dir.clone(),
@@ -1919,8 +2172,8 @@ async fn handle_sessions_repair(
     }
 }
 
-async fn handle_sessions_job(Path(id): Path<String>) -> Response {
-    match crate::sessions::get_repair_job(&id) {
+async fn handle_sessions_job(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match crate::sessions::get_repair_job_for_home(&s.codex_home, &id) {
         Some(job) => ok_env(job),
         None => err_env(
             StatusCode::NOT_FOUND,
@@ -1928,6 +2181,25 @@ async fn handle_sessions_job(Path(id): Path<String>) -> Response {
             "修复任务不存在",
             None,
         ),
+    }
+}
+
+async fn handle_sessions_job_cancel(Path(id): Path<String>) -> Response {
+    match crate::sessions::cancel_repair_job(&id) {
+        Ok(job) => ok_env(job),
+        Err(error) => err_env(StatusCode::CONFLICT, "E_SESSION_JOB_CANCEL", &error, None),
+    }
+}
+
+async fn handle_sessions_job_resume(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    // 应用重启后中断任务只存在于磁盘;先按 codex_home 补载进任务表,恢复才能找到检查点。
+    crate::sessions::get_repair_job_for_home(&s.codex_home, &id);
+    match crate::sessions::resume_repair_job(&id) {
+        Ok(job_id) => ok_env(json!({"jobId": job_id, "resumedFrom": id})),
+        Err(error) => err_env(StatusCode::CONFLICT, "E_SESSION_JOB_RESUME", &error, None),
     }
 }
 
@@ -2143,6 +2415,98 @@ async fn handle_desktop_host(State(s): State<Arc<AppState>>, Json(body): Json<Va
 // POST /api/desktop/unhost
 async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
     desktop_unhost_impl(&s)
+}
+
+// POST /api/desktop/recovery/preview {mode: reset-config|reset-all}
+#[derive(Debug, Deserialize)]
+struct DesktopRecoveryPreviewQuery {
+    mode: Option<String>,
+}
+
+async fn handle_desktop_recovery_preview_get(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<DesktopRecoveryPreviewQuery>,
+) -> Response {
+    match crate::codex_recovery::preview(
+        &s.codex_home,
+        &s.config_path,
+        query.mode.as_deref().unwrap_or("reset-config"),
+    ) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_RESET_PREVIEW", &error, None),
+    }
+}
+
+async fn handle_desktop_recovery_preview(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let mode = body
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("reset-config");
+    match crate::codex_recovery::preview(&s.codex_home, &s.config_path, mode) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_RESET_PREVIEW", &error, None),
+    }
+}
+
+// POST /api/desktop/recovery/apply {mode,previewToken,confirmed}
+async fn handle_desktop_recovery_apply(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("");
+    let token = body
+        .get("previewToken")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let confirmed = body
+        .get("confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match crate::codex_recovery::apply(&s.codex_home, &s.config_path, mode, token, confirmed) {
+        Ok(data) => ok_env(data),
+        Err(error) => {
+            let code = if error.starts_with("E_EXTERNAL_CONFIG_MANAGER_ACTIVE") {
+                "E_EXTERNAL_CONFIG_MANAGER_ACTIVE"
+            } else if error.starts_with("E_CODEX_CONFIG_CHANGED") {
+                "E_CODEX_CONFIG_CHANGED"
+            } else if error.starts_with("E_CODEX_RESET_ARTIFACT_CHANGED") {
+                "E_CODEX_RESET_ARTIFACT_CHANGED"
+            } else if error.starts_with("E_CONFIRM_REQUIRED") {
+                "E_CONFIRM_REQUIRED"
+            } else if error.starts_with("E_RESET_PREVIEW_EXPIRED") {
+                "E_RESET_PREVIEW_EXPIRED"
+            } else {
+                "E_RESET_APPLY"
+            };
+            err_env(StatusCode::CONFLICT, code, &error, None)
+        }
+    }
+}
+
+// GET /api/desktop/login/status
+async fn handle_desktop_login_status(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(
+        serde_json::to_value(crate::codex_security::probe_login_cached(&s.codex_home))
+            .unwrap_or_else(|_| json!({"state":"unknown"})),
+    )
+}
+
+// POST /api/desktop/login/start {deviceAuth?}
+async fn handle_desktop_login_start(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let device_auth = body
+        .get("deviceAuth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match crate::codex_security::start_login(&s.codex_home, device_auth) {
+        Ok(data) => ok_env(serde_json::to_value(data).unwrap_or_else(|_| json!({"started":true}))),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_CODEX_LOGIN_START", &error, None),
+    }
 }
 
 // POST /api/desktop/claude-start { way? }
@@ -2980,7 +3344,7 @@ mod tests {
         // 托管态:custom 段指向网关(与 desktop host gateway 同形态)+ active=p1
         std::fs::write(
             &st.config_path,
-            "[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n",
+            "model_provider = \"2xapi_gateway\"\n[model_providers.2xapi_gateway]\nbase_url = \"http://127.0.0.1:8787\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -4614,6 +4978,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_create_preview_apply_keeps_auth_boundary() {
+        let (state, root) = unique_state("profiles");
+        let app = build_router(state.clone());
+        let provider_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name":"P","baseUrl":"https://up.test","apiKey":"sk","model":"m","accessMode":"pure_api"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let provider = body_json(provider_resp).await;
+        let provider_id = provider["data"]["id"].as_str().unwrap().to_string();
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        std::fs::write(state.codex_home.join("auth.json"), "official-auth").unwrap();
+
+        let profile_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name":"本地档案","agent":"codex","providerId":provider_id,"model":"m","wireApi":"responses"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile_resp.status(), StatusCode::OK);
+        let profile = body_json(profile_resp).await;
+        let profile_id = profile["data"]["profile"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let preview_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profiles/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"id":profile_id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_resp.status(), StatusCode::OK);
+        let preview = body_json(preview_resp).await;
+        assert_eq!(preview["data"]["officialAuth"], "preserved");
+        let token = preview["data"]["previewToken"].as_str().unwrap();
+
+        let apply_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profiles/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"id":profile_id,"previewToken":token,"confirmed":true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(state.codex_home.join("auth.json")).unwrap(),
+            "official-auth"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn create_invalid_returns_422_validation() {
         let (state, root) = unique_state("valid");
         let app = build_router(state);
@@ -4663,7 +5109,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// M7 后端 E2E：create → activate → /health 同步（验前端顶栏契约）。
+    /// Codex 安全边界回归：旧 activate 接口不得再触碰 config/auth。
     #[tokio::test]
     async fn e2e_create_activate_health_reflects() {
         let (state, root) = unique_state("e2e");
@@ -4685,7 +5131,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         let id = v["data"]["id"].as_str().unwrap().to_string();
 
-        // activate（写 config.toml + 设 active）
+        // 旧 activate 曾经写 auth/config；现在必须稳定拒绝
         let app = build_router(state.clone());
         let resp = app
             .oneshot(
@@ -4698,17 +5144,18 @@ mod tests {
             )
             .await
             .unwrap();
+        let status = resp.status();
         let v = body_json(resp).await;
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["data"]["active_provider_id"], id);
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(v["error"]["code"], "E_CODEX_CONFIG_MUTATION_RETIRED");
 
-        // GET /health 反映 active
+        // GET /api/health 仍回到官方默认，且不伪造 active
         let app = build_router(state.clone());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/health")
+                    .uri("/api/health")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4718,8 +5165,7 @@ mod tests {
             .await
             .unwrap();
         let h: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(h["active_provider_id"], id);
-        assert_eq!(h["access_mode"], "mixed");
+        assert_eq!(h["provider"]["providerId"], "openai");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4804,7 +5250,7 @@ mod tests {
         assert!(cfg_after_host.contains("requires_openai_auth = false"));
         assert!(!cfg_after_host.contains("experimental_bearer_token"));
         let auth = std::fs::read_to_string(state.codex_home.join("auth.json")).unwrap();
-        assert!(auth.contains("sk-1"), "无账号应写供应商 key:\n{auth}");
+        assert_eq!(auth, r#"{"OPENAI_API_KEY":"sk-old"}"#);
 
         // state 反映托管
         let app = build_router(state.clone());
@@ -4851,10 +5297,10 @@ mod tests {
             "model 同步为新供应商(真机故障修复)"
         );
 
-        // direct 已放开（UI 对齐批，仅无官方账号）：custom 直指供应商 + key 落盘 bearer 字段
+        // direct 已永久退役：不得把上游 Key 写入 Codex 配置
         let app = build_router(state.clone());
-        let v = body_json(
-            app.oneshot(
+        let direct_resp = app
+            .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/desktop/host")
@@ -4865,21 +5311,10 @@ mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap(),
-        )
-        .await;
-        assert_eq!(v["data"]["hosted"], true);
-        assert_eq!(v["data"]["hosting"]["way"], "direct");
-        let cfg_direct = std::fs::read_to_string(&state.config_path).unwrap();
-        assert!(
-            cfg_direct.contains("base_url = \"https://b.test\""),
-            "custom 应直指供应商:\n{cfg_direct}"
-        );
-        assert!(
-            cfg_direct.contains("experimental_bearer_token = \"sk-2\""),
-            "direct=Key 落盘:\n{cfg_direct}"
-        );
-        assert!(cfg_direct.contains("requires_openai_auth = false"));
+            .unwrap();
+        assert_eq!(direct_resp.status(), StatusCode::GONE);
+        let direct_body = body_json(direct_resp).await;
+        assert_eq!(direct_body["error"], "E_DESKTOP_DIRECT_RETIRED");
 
         // unhost：回到干净态
         let app = build_router(state.clone());
@@ -4898,7 +5333,7 @@ mod tests {
         assert_eq!(v["data"]["restored"], true);
 
         let cfg_after = std::fs::read_to_string(&state.config_path).unwrap();
-        assert!(!cfg_after.contains("[model_providers.custom]"));
+        assert!(!cfg_after.contains("[model_providers.2xapi_gateway]"));
         assert_eq!(
             std::fs::read_to_string(state.codex_home.join("auth.json")).unwrap(),
             r#"{"OPENAI_API_KEY":"sk-old"}"#,
@@ -5540,20 +5975,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let app = build_router(state.clone());
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/providers/activate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({"id": id}).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        crate::providers::set_active(&state.providers_path, &id);
         let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
         assert_eq!(v["scopeNote"], "该供应商不在官方线路范围,已直连");
         let _ = std::fs::remove_dir_all(&root);

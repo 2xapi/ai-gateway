@@ -2,7 +2,7 @@
 //!
 //! 核心行为（01-D3/D5/D7，FR-4）：
 //! - **逐请求实时读 active provider** → 天然热切换（FR-4.9）：切 active 后下一个请求即走新 provider，进行中请求不受影响。
-//! - **Mixed/PureApi 一律用 `provider.api_key` 注入** `Authorization: Bearer`（key 来源 = Provider Store，01-D3），不透传 Codex 带来的凭证。
+//! - **Mixed/PureApi 按上游协议注入 `provider.api_key`**：OpenAI 兼容接口使用 `Authorization: Bearer`，Anthropic 接口使用 `x-api-key`（key 来源 = Provider Store，01-D3），不透传客户端带来的凭证。
 //! - per-provider 代理、超时返回 504、User-Agent、custom_headers；上游 4xx/5xx 原样透传。
 //! - 本文件为 **M3a：透传 + key 注入 + 热切换**。Responses↔Chat 协议转换（FR-5）在 M3b 实现（届时按 `wire_api=chat_completions` 在 `/responses` 入口做转换）。
 
@@ -342,7 +342,7 @@ fn anthropic_models(state: &AppState, requested_id: Option<&str>) -> Response<Bo
 
 /// Claude 转发(Claude 接入批次):与 Codex 路径(dispatch)隔离——
 /// - 取 agent=claude 的 active 供应商(规则见 providers::get_provider_for_agent,global active 是 codex 时取 claude 首个);
-/// - 注入该供应商 api_key 作 `Authorization: Bearer <key>`(Key 只走上游,不进日志),透传到供应商 base_url 的 `/v1/messages`;
+/// - 注入该供应商 api_key 作 `x-api-key: <key>` 与 `anthropic-version`(Key 只走上游,不进日志),透传到供应商 base_url 的 `/v1/messages`;
 /// - base_url 已以 `/v1` 结尾(挂载在根) → 拼 `/messages`;否则拼 `/v1/messages`(中转站两形态均可,CTO 实测 2xa.cc.cd 均 200);
 /// - 透传原样 body,**不做** Responses/Chat 转换(中转站原生 Anthropic 兼容);
 /// - R1 加速接线:与 Codex 同一体系——accel_plan 命中 → 首选 build_line_client;连接层失败且
@@ -440,10 +440,10 @@ async fn dispatch_anthropic_for(
 
     // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）；抽为闭包以支持换线重试(同 dispatch)
     let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
-        let mut rb = client.request(method.clone(), target.clone()).header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", provider.api_key),
-        );
+        let mut rb = client
+            .request(method.clone(), target.clone())
+            .header("x-api-key", &provider.api_key)
+            .header("anthropic-version", "2023-06-01");
         if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
             rb = rb.header(reqwest::header::USER_AGENT, ua);
         }
@@ -2728,7 +2728,7 @@ mod tests {
 
     // ── Claude 接入(批):/anthropic/* 路由────────────────────
 
-    /// mock 上游:同时挂 /v1/messages 与 /messages,记录 (Authorization, 命中的路径)。
+    /// mock 上游:同时挂 /v1/messages 与 /messages,记录 (x-api-key, 命中的路径)。
     async fn mock_anthropic_upstream() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s_v1 = seen.clone();
@@ -2740,7 +2740,7 @@ mod tests {
                     let seen = s_v1.clone();
                     async move {
                         let auth = h
-                            .get("authorization")
+                            .get("x-api-key")
                             .and_then(|v| v.to_str().ok())
                             .map(String::from)
                             .unwrap_or_default();
@@ -2755,7 +2755,7 @@ mod tests {
                     let seen = s_m.clone();
                     async move {
                         let auth = h
-                            .get("authorization")
+                            .get("x-api-key")
                             .and_then(|v| v.to_str().ok())
                             .map(String::from)
                             .unwrap_or_default();
@@ -3479,7 +3479,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Claude 接入:base_url 无 /v1 前缀 → 拼 /v1/messages;注入 Bearer {claude api_key};body 透传。
+    /// Claude 接入:base_url 无 /v1 前缀 → 拼 /v1/messages;注入 x-api-key {claude api_key};body 透传。
     #[tokio::test]
     async fn anthropic_route_injects_claude_key_and_hits_v1_messages() {
         let (base, seen) = mock_anthropic_upstream().await;
@@ -3500,7 +3500,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.first().map(|(a, _)| a.as_str()),
-            Some("Bearer sk-claude-secret")
+            Some("sk-claude-secret")
         );
         assert_eq!(seen.first().map(|(_, p)| p.as_str()), Some("/v1/messages"));
         let _ = std::fs::remove_dir_all(&root);
@@ -3524,7 +3524,7 @@ mod tests {
         // 命中 /v1/messages(而非 /v1/v1/messages 或 /messages)
         assert_eq!(
             seen.first().map(|(a, p)| (a.as_str(), p.as_str())),
-            Some(("Bearer sk-claude-v1", "/v1/messages"))
+            Some(("sk-claude-v1", "/v1/messages"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3558,7 +3558,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             seen.lock().unwrap().first().map(|(a, _)| a.as_str()),
-            Some("Bearer sk-claude-secret")
+            Some("sk-claude-secret")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3847,8 +3847,8 @@ mod tests {
                 .unwrap()
                 .first()
                 .map(|(a, p)| (a.as_str(), p.as_str())),
-            Some(("Bearer sk-claude-line", "/v1/messages")),
-            "上游应经代理收到请求并保留 Bearer 注入"
+            Some(("sk-claude-line", "/v1/messages")),
+            "上游应经代理收到请求并保留 x-api-key 注入"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3885,7 +3885,7 @@ mod tests {
         assert!(px_seen.lock().unwrap().is_empty(), "未命中不应经代理");
         assert_eq!(
             up_seen.lock().unwrap().first().map(|(a, _)| a.as_str()),
-            Some("Bearer sk-claude-direct"),
+            Some("sk-claude-direct"),
             "直连应命中上游"
         );
         let _ = std::fs::remove_dir_all(&root);

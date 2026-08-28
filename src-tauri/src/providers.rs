@@ -292,7 +292,23 @@ pub fn load(path: &Path) -> ProviderData {
 
 fn save_atomic(path: &Path, data: &ProviderData, op: &str) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(data).map_err(|e| format!("序列化失败: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
+    let parent = path
+        .parent()
+        .ok_or_else(|| "供应商文件缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建供应商目录失败: {e}"))?;
+    // 兼容旧版本留下的固定临时路径：若它被目录占用，说明目录状态异常，
+    // 直接失败而不是绕过冲突继续写，便于上层事务回滚并提示用户清理。
+    let legacy_tmp = path.with_extension("json.tmp");
+    if legacy_tmp.is_dir() {
+        return Err(format!("临时文件路径被目录占用: {}", legacy_tmp.display()));
+    }
+    let tmp = parent.join(format!(
+        ".{}.2xapi-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("providers.json"),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&tmp, &raw).map_err(|e| format!("写临时文件失败: {e}"))?;
     #[cfg(unix)]
     {
@@ -300,6 +316,31 @@ fn save_atomic(path: &Path, data: &ProviderData, op: &str) -> Result<(), String>
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("设置临时文件权限失败: {e}"))?;
     }
+    #[cfg(windows)]
+    if path.exists() {
+        let old = parent.join(format!(
+            ".{}.2xapi-old-{}.bak",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("providers.json"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::rename(path, &old).map_err(|e| format!("替换旧供应商文件失败: {e}"))?;
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("重命名失败: {error}"));
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !path.exists() {
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("重命名失败: {error}"));
+        }
+    }
+    #[cfg(not(windows))]
     std::fs::rename(&tmp, path).map_err(|e| format!("重命名失败: {e}"))?;
     #[cfg(unix)]
     {
@@ -402,6 +443,22 @@ pub fn validate(input: &ProviderInput) -> Result<(), Vec<ValidationError>> {
                 field: "base_url".into(),
                 message: "base_url 末尾不带 /".into(),
             });
+        } else {
+            match reqwest::Url::parse(base) {
+                Ok(url) if !url.username().is_empty() || url.password().is_some() => {
+                    errs.push(ValidationError {
+                        field: "base_url".into(),
+                        message: "base_url 不得包含用户名或密码，请使用 API Key 字段".into(),
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    errs.push(ValidationError {
+                        field: "base_url".into(),
+                        message: "base_url 必须是合法 http(s) 地址".into(),
+                    });
+                }
+            }
         }
         if input.api_key.trim().is_empty() {
             errs.push(ValidationError {
@@ -423,6 +480,22 @@ pub fn validate(input: &ProviderInput) -> Result<(), Vec<ValidationError>> {
             errs.push(ValidationError {
                 field: "timeout_secs".into(),
                 message: "timeout_secs 须在 5~3600".into(),
+            });
+        }
+    }
+
+    if let Some(proxy) = input
+        .proxy_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let valid_proxy = reqwest::Url::parse(proxy)
+            .ok()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h"));
+        if !valid_proxy {
+            errs.push(ValidationError {
+                field: "proxy_url".into(),
+                message: "proxy_url 须为 http(s):// 或 socks5:// 地址".into(),
             });
         }
     }
@@ -507,6 +580,128 @@ pub fn update(
     input: ProviderInput,
 ) -> Result<Provider, Vec<ValidationError>> {
     let mut data = load(path);
+    let updated = update_loaded(&mut data, id, input)?;
+    save_atomic(path, &data, "update").map_err(io_errs)?;
+    Ok(updated)
+}
+
+/// 从 JSON 更新供应商。与旧的 `ProviderInput` 更新入口不同，此函数保留未提交的字段，
+/// 避免旧前端/部分 PUT 请求把 custom headers、子账号开关等字段重置为默认值。
+pub fn update_from_value(
+    path: &Path,
+    id: &str,
+    body: &Value,
+) -> Result<Provider, Vec<ValidationError>> {
+    let mut data = load(path);
+    let Some(existing) = data.providers.iter().find(|p| p.id == id).cloned() else {
+        return Err(vec![ValidationError {
+            field: "id".into(),
+            message: "供应商不存在".into(),
+        }]);
+    };
+    let mut input = value_to_input(body);
+    // 只在字段真正出现在请求中时覆盖。null 仍表示显式清空可选字段。
+    if !has_any(body, &["name"]) {
+        input.name = existing.name.clone();
+    }
+    if !has_any(body, &["agent"]) {
+        input.agent = existing.agent.clone();
+    }
+    if !has_any(body, &["icon"]) {
+        input.icon = existing.icon.clone();
+    }
+    if !has_any(body, &["iconColor", "icon_color"]) {
+        input.icon_color = existing.icon_color.clone();
+    }
+    if !has_any(body, &["websiteUrl", "website_url"]) {
+        input.website_url = existing.website_url.clone();
+    }
+    if !has_any(body, &["notes"]) {
+        input.notes = existing.notes.clone();
+    }
+    if !has_any(body, &["baseUrl", "base_url"]) {
+        input.base_url = existing.base_url.clone();
+    }
+    if !has_any(body, &["accessMode", "access_mode"]) {
+        input.access_mode = existing.access_mode;
+    }
+    if !has_any(body, &["wireApi", "wire_api"]) {
+        input.wire_api = existing.wire_api;
+    }
+    if !has_any(body, &["userAgent", "user_agent"]) {
+        input.user_agent = existing.user_agent.clone();
+    }
+    if !has_any(body, &["model"]) {
+        input.model = existing.model.clone();
+    }
+    if !has_any(body, &["models"]) {
+        input.models = existing.models.clone();
+    }
+    if !has_any(
+        body,
+        &["claudeDesktopModelRoutes", "claude_desktop_model_routes"],
+    ) {
+        input.claude_desktop_model_routes = Some(existing.claude_desktop_model_routes.clone());
+    }
+    if !has_any(body, &["contextWindow", "context_window"]) {
+        input.context_window = existing.context_window.clone();
+    }
+    if !has_any(body, &["proxyUrl", "proxy_url"])
+        || body
+            .get("proxyUrl")
+            .or_else(|| body.get("proxy_url"))
+            .and_then(Value::as_str)
+            .is_some_and(is_masked_proxy_url)
+    {
+        input.proxy_url = existing.proxy_url.clone();
+    }
+    if !has_any(body, &["timeoutSecs", "timeout_secs"]) {
+        input.timeout_secs = existing.timeout_secs;
+    }
+    if !has_any(body, &["sub2apiEnabled", "sub2api_enabled"]) {
+        input.sub2api_enabled = existing.sub2api_enabled;
+    }
+    if !has_any(body, &["sub2apiMultiplier", "sub2api_multiplier"]) {
+        input.sub2api_multiplier = existing.sub2api_multiplier;
+    }
+    if !has_any(body, &["customHeaders", "custom_headers"])
+        || body
+            .get("customHeaders")
+            .or_else(|| body.get("custom_headers"))
+            .is_some_and(is_masked_headers)
+    {
+        input.custom_headers = existing.custom_headers.clone();
+    }
+    if !has_any(body, &["reasoningLevels", "reasoning_levels"]) {
+        input.reasoning_levels = existing.reasoning_levels.clone();
+    }
+    let updated = update_loaded(&mut data, id, input)?;
+    save_atomic(path, &data, "update").map_err(io_errs)?;
+    Ok(updated)
+}
+
+fn has_any(body: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| body.get(*key).is_some())
+}
+
+fn is_masked_proxy_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .is_some_and(|url| url.username() == "***" || url.password() == Some("***"))
+}
+
+fn is_masked_headers(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    !object.is_empty() && object.values().all(|value| value.as_str() == Some("••••"))
+}
+
+fn update_loaded(
+    data: &mut ProviderData,
+    id: &str,
+    input: ProviderInput,
+) -> Result<Provider, Vec<ValidationError>> {
     let existing_key = data
         .providers
         .iter()
@@ -557,20 +752,28 @@ pub fn update(
         p.reasoning_levels = Some(levels);
     }
     let updated = p.clone();
-    save_atomic(path, &data, "update").map_err(io_errs)?;
     Ok(updated)
 }
 
 /// FR-1.5 删除：若删的是 active，active 置 None（不自动切换）。
+#[allow(dead_code)]
 pub fn delete(path: &Path, id: &str) {
+    let _ = delete_checked(path, id);
+}
+
+pub fn delete_checked(path: &Path, id: &str) -> Result<(), String> {
     let mut data = load(path);
+    let found = data.providers.iter().any(|p| p.id == id);
     data.providers.retain(|p| p.id != id);
     data.active_provider_ids
         .retain(|_, active_id| active_id != id);
     if data.active_provider_id.as_deref() == Some(id) {
         data.active_provider_id = None;
     }
-    let _ = save_atomic(path, &data, "delete");
+    if !found {
+        return Err("供应商不存在".into());
+    }
+    save_atomic(path, &data, "delete")
 }
 
 /// FR-1.3 列表：按 sort_index 升序。
@@ -582,20 +785,30 @@ pub fn list(path: &Path) -> Vec<Provider> {
 }
 
 /// FR-1.6 重排：按给定 id 顺序重写 sort_index。
+#[allow(dead_code)]
 pub fn reorder(path: &Path, ids: &[String]) {
+    let _ = reorder_checked(path, ids);
+}
+
+pub fn reorder_checked(path: &Path, ids: &[String]) -> Result<(), String> {
     let mut data = load(path);
     for (idx, id) in ids.iter().enumerate() {
         if let Some(p) = data.providers.iter_mut().find(|p| &p.id == id) {
             p.sort_index = idx as i64;
         }
     }
-    let _ = save_atomic(path, &data, "reorder");
+    save_atomic(path, &data, "reorder")
 }
 
 // ── active 管理（数据层；config 写入在 M2）──────────────────
 
 #[allow(dead_code)] // 测试/未来路由用
 pub fn set_active(path: &Path, id: &str) {
+    let _ = set_active_checked(path, id);
+}
+
+/// 持久化切换当前供应商，并把错误返回给托管事务，避免磁盘写失败却继续写 config。
+pub fn set_active_checked(path: &Path, id: &str) -> Result<(), String> {
     let mut data = load(path);
     let Some(agent) = data
         .providers
@@ -603,11 +816,11 @@ pub fn set_active(path: &Path, id: &str) {
         .find(|provider| provider.id == id)
         .map(|provider| provider.agent.clone())
     else {
-        return;
+        return Err("供应商不存在".into());
     };
     data.active_provider_ids.insert(agent, id.to_string());
     data.active_provider_id = Some(id.to_string());
-    let _ = save_atomic(path, &data, "set_active");
+    save_atomic(path, &data, "set_active")
 }
 
 /// 只切换指定平台的 active，不改兼容旧客户端使用的全局 active。
@@ -628,6 +841,10 @@ pub fn clear_active(path: &Path) {
 }
 
 pub fn clear_active_for_agent(path: &Path, agent: &str) {
+    let _ = clear_active_for_agent_checked(path, agent);
+}
+
+pub fn clear_active_for_agent_checked(path: &Path, agent: &str) -> Result<(), String> {
     let mut data = load(path);
     let agent = normalize_agent(agent);
     let removed = data.active_provider_ids.remove(&agent);
@@ -640,7 +857,7 @@ pub fn clear_active_for_agent(path: &Path, agent: &str) {
     {
         data.active_provider_id = data.active_provider_ids.values().next().cloned();
     }
-    let _ = save_atomic(path, &data, "clear_active");
+    save_atomic(path, &data, "clear_active")
 }
 
 pub fn get_active(path: &Path) -> Option<Provider> {
@@ -720,19 +937,95 @@ pub fn public_provider(p: &Provider) -> Value {
         "icon": p.icon, "iconColor": p.icon_color,
         "sortIndex": p.sort_index, "createdAt": p.created_at,
         "websiteUrl": p.website_url, "notes": p.notes,
-        "baseUrl": p.base_url, "apiKeyMasked": mask_key(&p.api_key),
+        "baseUrl": mask_base_url(&p.base_url), "apiKeyMasked": mask_key(&p.api_key),
         "accessMode": serde_json::to_value(p.access_mode).unwrap_or(json!("pure_api")),
         "wireApi": serde_json::to_value(p.wire_api).unwrap_or(json!("responses")),
         "userAgent": p.user_agent,
         "model": p.model, "models": p.models,
         "claudeDesktopModelRoutes": p.claude_desktop_model_routes,
         "contextWindow": p.context_window,
-        "proxyUrl": p.proxy_url, "timeoutSecs": p.timeout_secs,
+        "proxyUrl": p.proxy_url.as_deref().map(mask_proxy_url), "timeoutSecs": p.timeout_secs,
         "sub2apiEnabled": p.sub2api_enabled, "sub2apiMultiplier": p.sub2api_multiplier,
-        "customHeaders": p.custom_headers,
+        "customHeaders": mask_custom_headers(p.custom_headers.as_ref()),
         // 思考档位:前端读取名=snake reasoning_levels(app.js:318/577/715/782),None 序列化为 null。
         "reasoning_levels": p.reasoning_levels,
     })
+}
+
+fn mask_proxy_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return if value.trim().is_empty() {
+            String::new()
+        } else {
+            "已配置代理".into()
+        };
+    };
+    let has_credentials = !url.username().is_empty() || url.password().is_some();
+    if has_credentials {
+        let _ = url.set_username("***");
+        let _ = url.set_password(Some("***"));
+    }
+    mask_sensitive_query(&mut url);
+    url.to_string()
+}
+
+fn mask_base_url(value: &str) -> String {
+    let masked = mask_proxy_url(value);
+    if !value.ends_with('/') {
+        masked.trim_end_matches('/').to_string()
+    } else {
+        masked
+    }
+}
+
+fn mask_sensitive_query(url: &mut reqwest::Url) {
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let key_string = key.into_owned();
+            let value_string = if is_sensitive_url_key(&key_string) {
+                "***".to_string()
+            } else {
+                value.into_owned()
+            };
+            (key_string, value_string)
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return;
+    }
+    let mut query = url.query_pairs_mut();
+    query.clear();
+    for (key, value) in pairs {
+        query.append_pair(&key, &value);
+    }
+}
+
+fn is_sensitive_url_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "key"
+        || key == "api_key"
+        || key == "apikey"
+        || key == "token"
+        || key == "access_token"
+        || key == "secret"
+        || key == "password"
+        || key == "passwd"
+        || key == "auth"
+        || key.ends_with("_key")
+        || key.ends_with("_token")
+        || key.ends_with("_secret")
+}
+
+fn mask_custom_headers(headers: Option<&HashMap<String, String>>) -> Value {
+    let Some(headers) = headers else {
+        return Value::Null;
+    };
+    let masked = headers
+        .keys()
+        .map(|key| (key.clone(), Value::String("••••".into())))
+        .collect::<serde_json::Map<_, _>>();
+    Value::Object(masked)
 }
 
 /// Key 脱敏:前 3 + … + 尾 4(与 server.rs/usage_stats.rs 同口径)。按 chars 而非
@@ -1020,6 +1313,85 @@ mod tests {
     }
 
     #[test]
+    fn public_provider_masks_proxy_credentials_and_custom_headers() {
+        let mut provider = sample_provider();
+        provider.proxy_url = Some("http://relay-user:relay-pass@127.0.0.1:7890".into());
+        provider.base_url = "https://api.example.test/v1?api_key=base-secret&region=cn".into();
+        provider.custom_headers = Some(HashMap::from([
+            ("Authorization".into(), "Bearer secret".into()),
+            ("X-Relay-Key".into(), "relay-secret".into()),
+        ]));
+        let public = public_provider(&provider);
+        assert_eq!(public["proxyUrl"], "http://***:***@127.0.0.1:7890/");
+        assert_eq!(
+            public["baseUrl"],
+            "https://api.example.test/v1?api_key=***&region=cn"
+        );
+        assert_eq!(public["customHeaders"]["Authorization"], "••••");
+        assert_eq!(public["customHeaders"]["X-Relay-Key"], "••••");
+        assert!(!public.to_string().contains("relay-pass"));
+        assert!(!public.to_string().contains("relay-secret"));
+        assert!(!public.to_string().contains("base-secret"));
+    }
+
+    #[test]
+    fn value_update_preserves_omitted_sensitive_and_optional_fields() {
+        let path = tmp_path("partial_update");
+        let mut input = sample_input("Original", AccessMode::Mixed);
+        input.base_url = "https://up.test".into();
+        input.api_key = "sk-original".into();
+        input.proxy_url = Some("http://user:pass@127.0.0.1:7890".into());
+        input.custom_headers = Some(HashMap::from([(
+            "Authorization".into(),
+            "Bearer secret".into(),
+        )]));
+        input.notes = Some("keep me".into());
+        input.reasoning_levels = Some(vec!["high".into()]);
+        let created = create(&path, input).unwrap();
+        let updated = update_from_value(
+            &path,
+            &created.id,
+            &json!({
+                "name": "Renamed",
+                "model": "m2"
+            }),
+        )
+        .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.model, "m2");
+        assert_eq!(updated.api_key, "sk-original");
+        assert_eq!(
+            updated.proxy_url.as_deref(),
+            Some("http://user:pass@127.0.0.1:7890")
+        );
+        assert_eq!(
+            updated.custom_headers.as_ref().unwrap()["Authorization"],
+            "Bearer secret"
+        );
+        assert_eq!(updated.notes.as_deref(), Some("keep me"));
+        assert_eq!(updated.reasoning_levels.as_ref().unwrap(), &["high"]);
+        let masked_update = update_from_value(
+            &path,
+            &created.id,
+            &json!({
+                "name": "Renamed again",
+                "proxyUrl": "http://***:***@127.0.0.1:7890/",
+                "customHeaders": {"Authorization": "••••"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            masked_update.proxy_url.as_deref(),
+            Some("http://user:pass@127.0.0.1:7890")
+        );
+        assert_eq!(
+            masked_update.custom_headers.as_ref().unwrap()["Authorization"],
+            "Bearer secret"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn validation_branches() {
         // 空 name
         assert!(has_field(
@@ -1046,6 +1418,9 @@ mod tests {
         // 合法
         i.api_key = "sk".into();
         assert!(validate(&i).is_ok(), "{:?}", validate(&i));
+        // 凭据不得嵌入 URL（公开 provider 诊断会回传 endpoint）
+        i.base_url = "https://user:pass@up.test".into();
+        assert!(has_field(&validate(&i).unwrap_err(), "base_url"));
 
         // Official：无需 base_url/key
         assert!(validate(&sample_input("O", AccessMode::Official)).is_ok());
@@ -1058,6 +1433,17 @@ mod tests {
         assert!(has_field(&validate(&t).unwrap_err(), "timeout_secs"));
         t.timeout_secs = Some(120);
         assert!(validate(&t).is_ok());
+
+        // 每个供应商的独立代理支持 HTTP(S)/SOCKS5
+        let mut proxy = sample_input("Proxy", AccessMode::Mixed);
+        proxy.base_url = "https://up.test".into();
+        proxy.api_key = "sk-proxy".into();
+        proxy.proxy_url = Some("socks5://127.0.0.1:1080".into());
+        assert!(validate(&proxy).is_ok());
+        proxy.proxy_url = Some("ftp://127.0.0.1:7890".into());
+        assert!(has_field(&validate(&proxy).unwrap_err(), "proxy_url"));
+        proxy.proxy_url = Some("http://127.0.0.1:7890".into());
+        assert!(validate(&proxy).is_ok());
 
         // multiplier <= 0
         let mut m = sample_input("M", AccessMode::Official);

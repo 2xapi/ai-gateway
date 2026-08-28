@@ -53,7 +53,15 @@ fn write_private_json(path: &Path, value: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // 私密配置可能被多个 UI 请求同时更新，不能共享固定 tmp 路径。
+    let tmp = parent.join(format!(
+        ".{}.2xapi-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("secrets.json"),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(
         &tmp,
         serde_json::to_string_pretty(value).unwrap_or_default(),
@@ -61,9 +69,40 @@ fn write_private_json(path: &Path, value: &Value) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
     }
-    std::fs::rename(&tmp, path)?;
+    #[cfg(windows)]
+    if path.exists() {
+        let old = parent.join(format!(
+            ".{}.2xapi-{}.old",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("secrets.json"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::rename(path, &old)?;
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !path.exists() {
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

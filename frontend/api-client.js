@@ -192,6 +192,13 @@
     diagnose: (id) => request("POST", "/api/providers/diagnose", { body: { id } }),
     fetchModels: (body) => request("POST", "/api/providers/fetch-models", { body }),
     fetchBalance: (id) => request("POST", "/api/providers/fetch-balance", { body: { id } }),
+    // ── P0 配置档案（只包含路由元数据，不包含凭据）──
+    profiles: (agent) => request("GET", "/api/profiles" + (agent ? "?agent=" + encodeURIComponent(agent) : "")),
+    createProfile: (profile) => request("POST", "/api/profiles", { body: profile }),
+    updateProfile: (id, profile) => request("PUT", "/api/profiles/" + encodeURIComponent(id), { body: profile }),
+    deleteProfile: (id) => request("DELETE", "/api/profiles/" + encodeURIComponent(id)),
+    previewProfile: (body) => request("POST", "/api/profiles/preview", { body }),
+    applyProfile: (body) => request("POST", "/api/profiles/apply", { body }),
     // ── 健康（不走信封，04 §2）──
     health: async () => (await fetch("/health")).json(),
     // ── 关于:版本与更新检查统一走后端信封，避免 CSP 跨域与假版本回退──
@@ -228,6 +235,12 @@
     // ── 桌面版托管开关（阶段 1，任务书 §1.1）──
     // host/unhost 的错误形态为 {"error": code, "message": msg}（非 04 信封），需单独剥出 code
     desktopState: () => request("GET", "/api/desktop/state"),
+    codexLoginStatus: () => request("GET", "/api/desktop/login/status"),
+    codexLoginStart: (deviceAuth) => request("POST", "/api/desktop/login/start", { body: { deviceAuth: deviceAuth === true } }),
+    codexRecoveryPreview: (mode) => request("POST", "/api/desktop/recovery/preview", { body: { mode: mode || "reset-config" } }),
+    codexRecoveryApply: (mode, previewToken, confirmed) => request("POST", "/api/desktop/recovery/apply", {
+      body: { mode: mode || "reset-config", previewToken: previewToken || "", confirmed: confirmed === true },
+    }),
     // ── 开机自启(竞品吸收 1.1-3):launchd plist,{enabled} ──
     autostart: () => request("GET", "/api/autostart"),
     setAutostart: (enabled) => request("POST", "/api/autostart", { body: { enabled } }),
@@ -413,8 +426,11 @@
     // ── Codex++ 风格会话管理 ──
     sessions: (page, size, snapshotId) => request("GET", "/api/sessions?page=" + (page || 1) + "&size=" + (size || 50) + (snapshotId ? "&snapshotId=" + encodeURIComponent(snapshotId) : "")),
     sessionsInspect: () => request("GET", "/api/sessions/inspect"),
-    sessionsRepair: (targetProvider) => request("POST", "/api/sessions/repair", { body: { targetProvider: targetProvider } }),
+    sessionsRepair: (targetProvider, previewToken) => request("POST", "/api/sessions/repair", { body: { targetProvider: targetProvider, ...(previewToken ? { previewToken: previewToken } : {}) } }),
+    sessionsRepairPreview: (targetProvider) => request("POST", "/api/sessions/repair/preview", { body: { targetProvider: targetProvider } }),
     sessionsJob: (id) => request("GET", "/api/sessions/jobs/" + encodeURIComponent(id)),
+    sessionsJobCancel: (id) => request("POST", "/api/sessions/jobs/" + encodeURIComponent(id) + "/cancel", { body: {} }),
+    sessionsJobResume: (id) => request("POST", "/api/sessions/jobs/" + encodeURIComponent(id) + "/resume", { body: {} }),
     sessionsResume: (id) => request("POST", "/api/sessions/" + encodeURIComponent(id) + "/resume"),
     sessionsDeletePreview: (ids) => request("POST", "/api/sessions/delete-preview", { body: { ids: ids } }),
     sessionsDelete: (confirmToken) => request("POST", "/api/sessions/delete", { body: { confirmToken: confirmToken } }),

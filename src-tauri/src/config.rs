@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 #[allow(unused_imports)] // PathBuf 仅测试用
 use std::path::{Path, PathBuf};
 
-use crate::providers::{AccessMode, ModelConfig, Provider, ProviderData};
+#[cfg(test)]
+use crate::providers::ProviderData;
+use crate::providers::{AccessMode, ModelConfig, Provider};
 
 /// 网关地址：config 里 `custom.base_url` 指向它（02 §5.2）。
 pub const GATEWAY_BASE_URL: &str = "http://127.0.0.1:8787";
@@ -34,7 +36,23 @@ fn write_private_atomic(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败({context}): {e}"))?;
     }
-    let tmp = path.with_extension(tmp_extension);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // 旧版本使用固定临时名；若该路径被目录占用，保留明确失败语义，
+    // 同时新写入使用 UUID 避免并发请求互相覆盖。
+    let legacy_tmp = path.with_extension(tmp_extension);
+    if legacy_tmp.is_dir() {
+        return Err(format!(
+            "临时文件路径被目录占用({context}): {}",
+            legacy_tmp.display()
+        ));
+    }
+    let tmp = parent.join(format!(
+        ".{}.2xapi-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config"),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&tmp, data).map_err(|e| format!("写入临时文件失败({context}): {e}"))?;
     #[cfg(unix)]
     {
@@ -44,6 +62,34 @@ fn write_private_atomic(
             return Err(format!("设置临时文件权限失败({context}): {error}"));
         }
     }
+    #[cfg(windows)]
+    if path.exists() {
+        let old = parent.join(format!(
+            ".{}.2xapi-{}.old",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if let Err(error) = std::fs::rename(path, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换旧文件失败({context}): {error}"));
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("重命名失败({context}): {error}"));
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !path.exists() {
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("重命名失败({context}): {error}"));
+        }
+    }
+    #[cfg(not(windows))]
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("重命名失败({context}): {error}"));
@@ -69,6 +115,7 @@ pub fn read_toml(path: &Path) -> Value {
 }
 
 /// JSON Value → 原子写 TOML（临时文件→rename）。
+#[cfg(test)]
 pub fn write_toml(path: &Path, cfg: &Value) -> Result<(), String> {
     let toml_val = json_to_toml(cfg);
     let s = toml::to_string_pretty(&toml_val).map_err(|e| format!("TOML 编码失败: {e}"))?;
@@ -123,6 +170,7 @@ fn json_to_toml(v: &Value) -> toml::Value {
 
 // ── auth.json 读写 ───────────────────────────────────────────
 
+#[cfg(test)]
 pub(crate) fn read_auth_json(path: &Path) -> Value {
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or(json!({})),
@@ -130,6 +178,7 @@ pub(crate) fn read_auth_json(path: &Path) -> Value {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_auth_json(path: &Path, v: &Value) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
     write_private_atomic(path, raw.as_bytes(), "json.tmp", "auth.json")
@@ -201,6 +250,7 @@ pub fn build_config_value(current: &Value, provider: &Provider, catalog_path: &s
 // ── 结果结构 ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg(test)]
 pub struct ApplyOutcome {
     pub config_written: bool,
     pub auth_changed: bool,
@@ -218,6 +268,7 @@ pub struct PreviewOutcome {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg(test)]
 pub struct ActivateResult {
     pub active_provider_id: String,
     pub config_written: bool,
@@ -226,6 +277,7 @@ pub struct ActivateResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg(test)]
 pub struct OfficialOutcome {
     pub config_written: bool,
     pub auth_restored: bool,
@@ -235,6 +287,7 @@ pub struct OfficialOutcome {
 
 /// 应用一个 provider（按其 access_mode 写 config/auth）。幂等（FR-2.5）。
 /// `backup_dir` 用于 apply 前对 config.toml 的安全快照（/api/backups 用）；auth 备份固定落 `codex_home`。
+#[cfg(test)]
 pub fn apply_provider(
     config_path: &Path,
     backup_dir: &Path,
@@ -354,6 +407,7 @@ pub fn preview_provider(
 // ── activate / activate-official（FR-2.1~2.5）───────────────
 
 /// 激活某 provider：apply + 设置 active + 写 snapshot。返回三布尔。
+#[cfg(test)]
 pub fn activate(
     config_path: &Path,
     backup_dir: &Path,
@@ -389,6 +443,7 @@ pub fn activate(
 }
 
 /// 切回官方：恢复 auth.json（从 .bak）+ config 改 official + 清 active。
+#[cfg(test)]
 pub fn activate_official(
     config_path: &Path,
     backup_dir: &Path,

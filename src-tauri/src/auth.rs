@@ -31,14 +31,53 @@ fn write_private(path: &Path, raw: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // 登录/记住账号可能由并发请求触发，使用唯一同目录临时文件避免互相覆盖。
+    let tmp = parent.join(format!(
+        ".{}.2xapi-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("auth.json"),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&tmp, raw)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
     }
-    std::fs::rename(&tmp, path)?;
+    #[cfg(windows)]
+    if path.exists() {
+        let old = parent.join(format!(
+            ".{}.2xapi-{}.old",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("auth.json"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::rename(path, &old)?;
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !path.exists() {
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -97,14 +136,19 @@ pub async fn refresh_session(codex_home: &Path) -> Option<Session> {
         user: old.user.clone(),
         auto_refresh: true,
     };
-    let _ = write_private(
+    write_private(
         &session_path(codex_home),
         &serde_json::to_string_pretty(&session).unwrap_or_default(),
-    );
+    )
+    .ok()?;
     Some(session)
 }
 
-pub fn save_session(codex_home: &Path, result: &LoginResult, auto_refresh: bool) {
+pub fn save_session(
+    codex_home: &Path,
+    result: &LoginResult,
+    auto_refresh: bool,
+) -> Result<(), String> {
     let session = Session {
         access_token: result.access_token.clone(),
         refresh_token: result.refresh_token.clone(),
@@ -113,7 +157,7 @@ pub fn save_session(codex_home: &Path, result: &LoginResult, auto_refresh: bool)
         auto_refresh,
     };
     let raw = serde_json::to_string_pretty(&session).unwrap_or_default();
-    let _ = write_private(&session_path(codex_home), &raw);
+    write_private(&session_path(codex_home), &raw).map_err(|e| format!("保存登录状态失败: {e}"))
 }
 
 pub fn clear_session(codex_home: &Path) {
@@ -143,9 +187,10 @@ pub fn load_remembered(codex_home: &Path) -> Option<(String, String)> {
     }
 }
 
-pub fn save_remembered(codex_home: &Path, email: &str, _password: &str) {
+pub fn save_remembered(codex_home: &Path, email: &str, _password: &str) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(&json!({ "email": email })).unwrap_or_default();
-    let _ = write_private(&remembered_path(codex_home), &raw);
+    write_private(&remembered_path(codex_home), &raw)
+        .map_err(|e| format!("保存记住的账号失败: {e}"))
 }
 
 pub fn clear_remembered(codex_home: &Path) {
@@ -356,7 +401,7 @@ mod tests {
     #[test]
     fn remembered_account_never_persists_password() {
         let home = temp_home("remembered");
-        save_remembered(&home, "user@example.com", "plain-secret");
+        save_remembered(&home, "user@example.com", "plain-secret").unwrap();
         let raw = std::fs::read_to_string(remembered_path(&home)).unwrap();
         assert!(raw.contains("user@example.com"));
         assert!(!raw.contains("plain-secret"));
@@ -388,7 +433,7 @@ mod tests {
             expires_in: 3600,
             user: json!({ "email": "user@example.com" }),
         };
-        save_session(&home, &login, false);
+        save_session(&home, &login, false).unwrap();
         let raw = std::fs::read_to_string(session_path(&home)).unwrap();
         let session: Session = serde_json::from_str(&raw).unwrap();
         assert!(!session.auto_refresh);

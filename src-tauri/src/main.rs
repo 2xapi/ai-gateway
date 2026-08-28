@@ -10,6 +10,9 @@ mod auth;
 mod autostart;
 mod backups;
 mod claude_sessions;
+mod codex_overlay;
+mod codex_recovery;
+mod codex_security;
 mod config;
 mod desktop;
 mod diagnose;
@@ -26,6 +29,7 @@ mod media_tools;
 mod nodecreds;
 mod plugins;
 mod probe;
+mod profiles;
 mod providers;
 mod registry;
 mod sessions;
@@ -336,10 +340,23 @@ fn main() {
     std::fs::create_dir_all(&backup_dir).ok();
 
     // 网关固定监听 127.0.0.1:8787（契约要求：Codex 的 config.toml 里 custom.base_url 指向此地址）
-    let listener = TcpListener::bind("127.0.0.1:8787")
-        .expect("无法绑定 127.0.0.1:8787（端口可能被占用，请先释放后重试）");
-    // tokio::from_std 要求非阻塞 socket（否则 panic，tokio#7172）
-    listener.set_nonblocking(true).expect("set_nonblocking");
+    let listener = match TcpListener::bind("127.0.0.1:8787") {
+        Ok(listener) => {
+            // tokio::from_std 要求非阻塞 socket（否则 panic，tokio#7172）
+            if let Err(error) = listener.set_nonblocking(true) {
+                eprintln!("[gateway] 设置监听 socket 失败: {error}");
+                None
+            } else {
+                Some(listener)
+            }
+        }
+        Err(error) => {
+            // 多开应用时复用已存在的本地网关，避免 panic 直接退出；若占用者不是
+            // 2xapi，前端仍会显示其健康状态失败，用户可按提示释放 8787。
+            eprintln!("[gateway] 127.0.0.1:8787 已被占用，复用现有网关: {error}");
+            None
+        }
+    };
     let app_url = "http://127.0.0.1:8787".to_string();
 
     // M8:启动器状态 → 先清扫崩溃残留(只清带 launcher.json 标记的目录),再起后台退出监控
@@ -438,26 +455,42 @@ fn main() {
 
     // Start HTTP server in a dedicated thread with its own tokio runtime
     let codex_home_for_server = codex_home.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            // 阶段 4:后台健康探测循环(每 30s 快照 HealthState.lines 探测;线路可经 set_lines 更新)。
-            // spawn_health_loop 内部自行 tokio::spawn,此处直接调用即可。
-            crate::acclines::spawn_health_loop(
-                health_state.clone(),
-                std::time::Duration::from_secs(30),
-            );
-            // 任务书 §五:远程线路表刷新(启动即拉 + 每 60min;accel-remote.json
-            // 未配置时静默跳过,不影响内置/缓存表)。
-            crate::acclines::spawn_refresh_loop(
-                health_state.clone(),
-                codex_home_for_server.clone(),
-                std::time::Duration::from_secs(3600),
-            );
-            axum::serve(listener, router).await.unwrap();
+    if let Some(listener) = listener {
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(error) => {
+                    eprintln!("[gateway] 创建 Tokio runtime 失败: {error}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("[gateway] 接管监听 socket 失败: {error}");
+                        return;
+                    }
+                };
+                // 阶段 4:后台健康探测循环(每 30s 快照 HealthState.lines 探测;线路可经 set_lines 更新)。
+                // spawn_health_loop 内部自行 tokio::spawn,此处直接调用即可。
+                crate::acclines::spawn_health_loop(
+                    health_state.clone(),
+                    std::time::Duration::from_secs(30),
+                );
+                // 任务书 §五:远程线路表刷新(启动即拉 + 每 60min;accel-remote.json
+                // 未配置时静默跳过,不影响内置/缓存表)。
+                crate::acclines::spawn_refresh_loop(
+                    health_state.clone(),
+                    codex_home_for_server.clone(),
+                    std::time::Duration::from_secs(3600),
+                );
+                if let Err(error) = axum::serve(listener, router).await {
+                    eprintln!("[gateway] HTTP 服务已停止: {error}");
+                }
+            });
         });
-    });
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())

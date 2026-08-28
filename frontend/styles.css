@@ -342,11 +342,11 @@ button { font-family: inherit; }
 @media (prefers-reduced-motion: reduce) { .login-spinner { animation:none; } }
 .usage-overlay { box-sizing:border-box; width:100vw; min-height:100vh; padding:16px 18px; color:#f4f7fb; background:rgba(20,25,32,.88); border:1px solid rgba(255,255,255,.14); border-radius:14px; font-family:var(--sans); user-select:none; }
 .usage-overlay-head,.usage-overlay-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; color:#b8c0cb; font-size:12px; }
-.usage-overlay-head { cursor:grab; touch-action:none; -webkit-app-region:no-drag; }
+.usage-overlay-head { cursor:grab; touch-action:none; -webkit-app-region:drag; app-region:drag; }
 .usage-overlay-head b { flex:none; }
 .usage-overlay-version { color:#7f8996; font:9px var(--mono); }
 .usage-overlay-drag { flex:1; min-width:24px; height:24px; cursor:inherit; }
-.usage-overlay-close,.usage-overlay-foot button { border:0; background:transparent; color:#b8c0cb; cursor:pointer; font-size:18px; line-height:1; padding:0 3px; -webkit-app-region:no-drag; }
+.usage-overlay-close,.usage-overlay-foot button { border:0; background:transparent; color:#b8c0cb; cursor:pointer; font-size:18px; line-height:1; padding:0 3px; -webkit-app-region:no-drag; app-region:no-drag; }
 .usage-overlay-value { margin:16px 0 6px; font:700 25px var(--mono); letter-spacing:0; }
 .usage-overlay-meta { color:#9ca7b4; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .usage-overlay-foot { margin-top:18px; font-size:10.5px; }

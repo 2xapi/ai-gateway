@@ -1,22 +1,11 @@
 //! 桌面版托管开关(阶段 1,开发任务书 §1.1)。
 //!
-//! 桌面版 ChatGPT.app 无法注入 env/参数,唯一配置入口是 `~/.codex/config.toml`。
-//! 「托管」= 字段级合并写一处 `[model_providers.custom]` 指向本机网关 8787:
-//! - 有官方登录 → `requires_openai_auth=true`(混入:官方 token 发网关,网关丢弃并注入中转 Key)
-//! - 无官方登录 → `requires_openai_auth=false` + auth.json 写 OPENAI_API_KEY(纯 API 形态,先备份)
-//!
-//! 配置文件零 Key(Key 由网关注入);「还原」= unhost。
+//! 桌面版 ChatGPT.app 无法注入 env/参数，唯一配置入口是 `~/.codex/config.toml`。
+//! 「托管」= 保格式合并写入独占的 `[model_providers.2xapi_gateway]`，指向本机网关 8787。
+//! 官方 CLI 的 file/keyring 凭据由本模块完全只读；网关托管不读取、不创建、不改写 `auth.json`。
 //!
 //! 与 config.rs(M2)的关系:复用其 toml 读写/备份/catalog 原语,但合并逻辑独立——
-//! M2 的 Mixed 会写 experimental_bearer_token 且 requires_openai_auth 恒 true,
-//! 与任务书 §1.1(b) 契约(零 bearer、按账号态取值)不同,M2 行为保持不动。
-//!
-//! direct 通路(UI 对齐批放开,仅限无官方账号):custom 段直指供应商,供应商 key 以
-//! `experimental_bearer_token` 写入 config.toml——阶段 1 已实测该字段即 direct 的 provider
-//! 段 Bearer 字段(codex 二进制 18 字段清单 + 隔离环境 `codex exec` 上游收到
-//! `Authorization: Bearer <该字段值>`)。与网关的「零 Key」卖点相反,key 落盘是阶段 1
-//! 定稿的差异,UI 文案由前端区分,后端只管写入。有官方账号时维持 4xx 拒绝
-//! (token/bearer 优先级待阶段 5 实测后再放开)。
+//! M2 的 Mixed/旧 direct 仅作为 legacy 状态报告，不会被新版本自动采信或恢复。
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -24,8 +13,7 @@ use std::path::{Path, PathBuf};
 use std::{io::Write, process::Stdio};
 
 use crate::config::{
-    backup_file, build_model_catalog, config_to_toml_string, read_auth_json, read_toml,
-    write_auth_json, write_toml, AUTH_OFFICIAL_BAK, GATEWAY_BASE_URL, MODEL_CATALOG_FILENAME,
+    backup_file, build_model_catalog, read_toml, GATEWAY_BASE_URL, MODEL_CATALOG_FILENAME,
 };
 use crate::providers::Provider;
 
@@ -133,7 +121,13 @@ pub(crate) fn set_active_checked(
     expected_agent: &str,
 ) -> Result<(), OpError> {
     validate_provider_agent(provider, expected_agent)?;
-    crate::providers::set_active(providers_path, &provider.id);
+    crate::providers::set_active_checked(providers_path, &provider.id).map_err(|error| {
+        (
+            500,
+            "E_ACTIVE_WRITE".into(),
+            format!("保存 {expected_agent} 当前供应商失败: {error}"),
+        )
+    })?;
     if crate::providers::get_active_for_agent(providers_path, expected_agent)
         .is_some_and(|active| active.id == provider.id)
     {
@@ -154,7 +148,15 @@ pub(crate) fn clear_active_checked(
     if !providers_path.exists() {
         return Ok(());
     }
-    crate::providers::clear_active_for_agent(providers_path, expected_agent);
+    crate::providers::clear_active_for_agent_checked(providers_path, expected_agent).map_err(
+        |error| {
+            (
+                500,
+                "E_ACTIVE_WRITE".into(),
+                format!("清理 {expected_agent} 当前供应商失败: {error}"),
+            )
+        },
+    )?;
     if crate::providers::get_active_for_agent(providers_path, expected_agent).is_none() {
         Ok(())
     } else {
@@ -180,40 +182,6 @@ fn live_snapshots(paths: &[PathBuf]) -> Result<Vec<(PathBuf, FileSnapshot)>, OpE
         .collect()
 }
 
-// ── hasOfficial 判定 ─────────────────────────────────────────
-
-/// auth.json 是否含官方登录态(ChatGPT 账号 token)。
-/// ⚠️探索点(任务书 §1.1(a)):官方登录的实际字段名以真机为准,本机当前无官方登录、无法观察,
-/// 故写成通用检查——存在键名含 "token" 且值非空的字段(官方 OAuth 形态为 `tokens` 对象)即算;
-/// 仅 OPENAI_API_KEY 或文件不存在/解析失败 → false。
-pub fn has_official(codex_home: &Path) -> bool {
-    let raw = match std::fs::read_to_string(codex_home.join("auth.json")) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    let obj = match serde_json::from_str::<Value>(&raw) {
-        Ok(Value::Object(o)) => o,
-        _ => return false,
-    };
-    for (k, v) in &obj {
-        if k == "OPENAI_API_KEY" {
-            continue;
-        }
-        if !k.to_lowercase().contains("token") {
-            continue;
-        }
-        let nonempty = match v {
-            Value::String(s) => !s.is_empty(),
-            Value::Object(o) => !o.is_empty(),
-            _ => false,
-        };
-        if nonempty {
-            return true;
-        }
-    }
-    false
-}
-
 // ── hosting 判定 ─────────────────────────────────────────────
 
 /// 当前 config.toml 是否处于本软件托管态。
@@ -228,7 +196,18 @@ pub fn has_official(codex_home: &Path) -> bool {
 /// 阶段 1 备注的更完备方案(旁写 2xapi 标记键或独立 state 文件)留待后续批次。
 pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     let cfg = read_toml(config_path);
-    let custom = cfg.get("model_providers").and_then(|m| m.get("custom"));
+    let Some(active_provider) = cfg.get("model_provider").and_then(|value| value.as_str()) else {
+        // 没有活动 provider 指针时，备用 custom 段不具备 ownership 证据。
+        return Value::Null;
+    };
+    let provider_id = match active_provider {
+        crate::codex_overlay::PROVIDER_ID => crate::codex_overlay::PROVIDER_ID,
+        "custom" => "custom",
+        // 非活动 provider 段即使含有旧 bearer/网关字段，也不属于当前托管，
+        // 避免 unhost 误把用户手写的备用配置当成 2xapi 所有内容。
+        _ => return Value::Null,
+    };
+    let custom = cfg.get("model_providers").and_then(|m| m.get(provider_id));
     let Some(custom) = custom else {
         return Value::Null;
     };
@@ -236,8 +215,16 @@ pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
         .get("base_url")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // 网关判定优先:M2 Mixed 形态(网关地址 + bearer)也归 gateway(流量实际走网关)
-    let way = if base_url.contains(GATEWAY_ADDR) {
+    // 独占 provider 是新托管标记；custom + loopback 仅兼容旧版状态。
+    let legacy_owned = custom.get("experimental_bearer_token").is_some()
+        || cfg
+            .get("model_catalog_json")
+            .and_then(|value| value.as_str())
+            .is_some_and(|path| path.contains(MODEL_CATALOG_FILENAME));
+    let way = if (provider_id == crate::codex_overlay::PROVIDER_ID
+        && base_url.contains(GATEWAY_ADDR))
+        || (provider_id == "custom" && base_url.contains(GATEWAY_ADDR) && legacy_owned)
+    {
         "gateway"
     } else if custom.get("experimental_bearer_token").is_some() {
         "direct"
@@ -264,8 +251,11 @@ pub fn gateway_alive() -> bool {
 
 /// GET /api/desktop/state
 pub fn state(config_path: &Path, providers_path: &Path, codex_home: &Path) -> Value {
+    let login = crate::codex_security::probe_login_cached(codex_home);
+    let signed_in = login.state == crate::codex_security::LoginState::SignedIn;
     json!({
-        "hasOfficial": has_official(codex_home),
+        "hasOfficial": signed_in,
+        "login": login,
         "hosting": detect_hosting(config_path, providers_path),
         "gateway": { "addr": GATEWAY_ADDR, "alive": gateway_alive() },
         "codexHome": codex_home.to_string_lossy(),
@@ -273,88 +263,6 @@ pub fn state(config_path: &Path, providers_path: &Path, codex_home: &Path) -> Va
 }
 
 // ── host ─────────────────────────────────────────────────────
-
-/// 合并出 gateway 托管态 config(零 Key:不写 experimental_bearer_token,任务书 §1.1(b) 契约)。
-/// model_catalog_json 恒插入:catalog 文件由 host 保证写入(无模型时生成最小目录),
-/// 真机教训——指向不存在的文件会让 codex(桌面版新建聊天/CLI)直接报
-/// "No such file or directory / failed to resolve feature override precedence"。
-fn build_hosted_config(
-    current: &Value,
-    provider: &Provider,
-    catalog_path: &str,
-    requires_openai_auth: bool,
-) -> Value {
-    let mut cfg = current.clone();
-    let obj = cfg.as_object_mut().expect("config 不是 object");
-    obj.insert("model_provider".into(), json!("custom"));
-    if !provider.model.is_empty() {
-        obj.insert("model".into(), json!(provider.model));
-    }
-    obj.insert("model_catalog_json".into(), json!(catalog_path));
-    let mut custom = serde_json::Map::new();
-    custom.insert("name".into(), json!("custom"));
-    custom.insert("base_url".into(), json!(GATEWAY_BASE_URL));
-    custom.insert("wire_api".into(), json!("responses"));
-    custom.insert("requires_openai_auth".into(), json!(requires_openai_auth));
-    let mp = obj.entry("model_providers").or_insert(json!({}));
-    if let Some(m) = mp.as_object_mut() {
-        m.insert("custom".into(), Value::Object(custom));
-    }
-    cfg
-}
-
-/// 合并出 direct 托管态 config(仅无官方账号,门控在 host() 开头)。
-/// custom 段直指供应商,key 以 `experimental_bearer_token` 落盘——阶段 1 实测该字段即
-/// direct 的 provider 段 Bearer 字段(codex 18 字段清单 + 隔离环境 `codex exec` 上游收到
-/// `Authorization: Bearer <该字段值>`)。与 gateway 零 Key 契约相反,UI 文案由前端区分。
-/// 不写 model_catalog_json / auth.json:direct 不经网关,bearer 已在 config,auth 无需动。
-fn build_direct_hosted_config(current: &Value, provider: &Provider) -> Value {
-    let mut cfg = current.clone();
-    let obj = cfg.as_object_mut().expect("config 不是 object");
-    obj.insert("model_provider".into(), json!("custom"));
-    if !provider.model.is_empty() {
-        obj.insert("model".into(), json!(provider.model));
-    }
-    let mut custom = serde_json::Map::new();
-    custom.insert("name".into(), json!("custom"));
-    custom.insert("base_url".into(), json!(provider.base_url));
-    custom.insert(
-        "wire_api".into(),
-        serde_json::to_value(provider.wire_api).unwrap_or(json!("responses")),
-    );
-    custom.insert("requires_openai_auth".into(), json!(false));
-    custom.insert("experimental_bearer_token".into(), json!(provider.api_key));
-    let mp = obj.entry("model_providers").or_insert(json!({}));
-    if let Some(m) = mp.as_object_mut() {
-        m.insert("custom".into(), Value::Object(custom));
-    }
-    cfg
-}
-
-/// 无官方账号时:auth.json 设 OPENAI_API_KEY;首次(.bak 不存在)先备份 host 前状态(01-D4 同语义)。
-/// 返回 (changed, backup_created)。
-fn ensure_auth_key(codex_home: &Path, api_key: &str) -> Result<(bool, bool), String> {
-    let auth_p = codex_home.join("auth.json");
-    let bak_p = codex_home.join(AUTH_OFFICIAL_BAK);
-    let mut created = false;
-    if !bak_p.exists() {
-        if let Ok(data) = std::fs::read(&auth_p) {
-            std::fs::write(&bak_p, &data).map_err(|e| format!("备份 auth 失败: {e}"))?;
-            created = true;
-        }
-    }
-    let mut existing = read_auth_json(&auth_p);
-    if existing.get("OPENAI_API_KEY").and_then(|v| v.as_str()) == Some(api_key) {
-        return Ok((false, created));
-    }
-    if existing.is_object() {
-        if let Some(o) = existing.as_object_mut() {
-            o.insert("OPENAI_API_KEY".into(), json!(api_key));
-        }
-        write_auth_json(&auth_p, &existing)?;
-    }
-    Ok((true, created))
-}
 
 /// POST /api/desktop/host {providerId, way}
 pub fn host(
@@ -372,13 +280,12 @@ pub fn host(
             "未知托管方式,仅支持 gateway / direct".into(),
         ));
     }
-    // direct 门控 hasOfficial(UI 对齐批):无官方账号放开;有官方 → 维持 4xx 拒绝
-    // (官方 token 与 experimental_bearer_token 的优先级待阶段 5 实测后再放开)
-    if way == "direct" && has_official(codex_home) {
+    // 桌面版 direct 会把 bearer 写入 Codex 配置，违反零凭据边界，永久退役。
+    if way == "direct" {
         return Err((
-            400,
-            "E_DIRECT_UNAVAILABLE".into(),
-            "官方登录下直连暂不支持".into(),
+            410,
+            "E_DESKTOP_DIRECT_RETIRED".into(),
+            "桌面版直连已退役，请使用零 Key 本地网关；终端直连仍可通过进程环境变量使用".into(),
         ));
     }
     let data = crate::providers::load(providers_path);
@@ -406,73 +313,46 @@ pub fn host(
 
     let io = |e: String| -> OpError { (500, "E_IO".to_string(), e) };
 
-    // direct 托管(仅无官方账号,门控在函数开头):字段级合并 + 备份,写完即托管态。
-    // 幂等:已 direct 托管同供应商时合并结果与现值相同 → 不写盘 no-op 200;
-    // 换路(gateway↔direct)/换供应商 → 重写 custom 段;备份 purpose 用 pre-switch
-    // (不新增 pre-host 快照,保住最初 pre-host 供 unhost 还原到首次托管前)。
-    if way == "direct" {
-        let snapshots = live_snapshots(&[config_path.to_path_buf(), providers_path.to_path_buf()])?;
-        let outcome = (|| {
-            let already = detect_hosting(config_path, providers_path);
-            let current = read_toml(config_path);
-            let merged = build_direct_hosted_config(&current, &provider);
-            let new_toml = config_to_toml_string(&merged).map_err(io)?;
-            let current_toml = config_to_toml_string(&current).unwrap_or_default();
-            let config_written = if new_toml != current_toml {
-                let purpose = if already.is_null() {
-                    "pre-host"
-                } else {
-                    "pre-switch"
-                };
-                backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
-                write_toml(config_path, &merged).map_err(io)?;
-                true
-            } else {
-                false
-            };
-            set_active_checked(providers_path, &provider, "codex")?;
-            Ok(json!({
-                "hosted": true, "switched": !already.is_null(),
-                "hasOfficial": false,
-                "hosting": detect_hosting(config_path, providers_path),
-                "changed": { "config": config_written, "auth": false },
-            }))
-        })();
-        return outcome.map_err(|error| rollback_files(error, &snapshots));
-    }
-
-    // 已处于 gateway 托管(含换供应商):custom 段不动(网关热切换),set_active;
+    // 已处于 gateway 托管(含换供应商):独占 provider 段保持稳定,set_active;
     // 真机故障补充(2026-08-15,交接日志):同步 model 字段与 catalog——不同步会让新供应商
     // 收到旧模型名/读到旧 catalog,桌面版与 CLI 均实测故障。决策本意(custom 稳定+热切换)保留。
     let already = detect_hosting(config_path, providers_path);
     if already.get("way").and_then(|v| v.as_str()) == Some("gateway") {
         let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+        let overlay_path = crate::codex_overlay::overlay_state_path(backup_dir);
         let snapshots = live_snapshots(&[
             config_path.to_path_buf(),
             catalog_path.clone(),
-            codex_home.join("auth.json"),
-            codex_home.join(AUTH_OFFICIAL_BAK),
             providers_path.to_path_buf(),
+            overlay_path.clone(),
         ])?;
         let outcome = (|| {
+            let previous_overlay =
+                crate::codex_overlay::read_overlay_state(&overlay_path).map_err(io)?;
+            let baseline_overlay = match previous_overlay {
+                Some(state) => Some(state),
+                None => Some(crate::codex_overlay::new_baseline(config_path).map_err(io)?),
+            };
             let mut config_written = false;
             let current = read_toml(config_path);
             let model_differs =
                 current.get("model").and_then(|v| v.as_str()) != Some(provider.model.as_str());
             let catalog_missing = !catalog_path.exists();
-            if (model_differs || catalog_missing) && !provider.model.is_empty() {
-                let mut merged = current.clone();
-                if let Some(obj) = merged.as_object_mut() {
-                    obj.insert("model".into(), json!(provider.model));
-                }
-                let new_toml = config_to_toml_string(&merged).map_err(io)?;
-                let current_toml = config_to_toml_string(&current).unwrap_or_default();
-                if new_toml != current_toml {
-                    backup_file(config_path, backup_dir, "config-apply", "pre-switch")
-                        .map_err(io)?;
-                    write_toml(config_path, &merged).map_err(io)?;
-                    config_written = true;
-                }
+            let provider_differs = current.get("model_provider").and_then(|v| v.as_str())
+                != Some(crate::codex_overlay::PROVIDER_ID);
+            if (model_differs || catalog_missing || provider_differs) && !provider.model.is_empty()
+            {
+                backup_file(config_path, backup_dir, "config-apply", "pre-switch").map_err(io)?;
+                let before = crate::codex_overlay::fingerprint(config_path).map_err(io)?;
+                let after = crate::codex_overlay::apply_gateway(
+                    config_path,
+                    GATEWAY_BASE_URL,
+                    &provider.model,
+                    &catalog_path.to_string_lossy(),
+                    before.sha256.as_deref(),
+                )
+                .map_err(io)?;
+                config_written = before.sha256 != after.sha256;
                 let catalog_models: Vec<crate::providers::ModelConfig> =
                     if provider.models.is_empty() {
                         vec![crate::providers::ModelConfig {
@@ -493,52 +373,64 @@ pub fn host(
                 std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| io(e.to_string()))?;
             }
 
-            let mut auth_changed = false;
-            if !has_official(codex_home) {
-                auth_changed = ensure_auth_key(codex_home, &provider.api_key)
-                    .map_err(io)?
-                    .0;
-            }
+            crate::codex_overlay::record_applied_state(
+                config_path,
+                backup_dir,
+                baseline_overlay,
+                Some(&catalog_path),
+            )
+            .map_err(io)?;
+
             set_active_checked(providers_path, &provider, "codex")?;
+            let login = crate::codex_security::probe_login_cached(codex_home);
             Ok(json!({
                 "hosted": true, "switched": true,
-                "hasOfficial": has_official(codex_home),
+                "hasOfficial": login.state == crate::codex_security::LoginState::SignedIn,
+                "login": login,
                 "hosting": detect_hosting(config_path, providers_path),
-                "changed": { "config": config_written, "auth": auth_changed },
+                "changed": { "config": config_written, "auth": false },
             }))
         })();
         return outcome.map_err(|error| rollback_files(error, &snapshots));
     }
 
     // 全量托管写(字段级合并 + 备份)
-    let has_off = has_official(codex_home);
-    let current = read_toml(config_path);
     let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
-    let merged = build_hosted_config(
-        &current,
-        &provider,
-        &catalog_path.to_string_lossy(),
-        has_off,
-    );
-    let new_toml = config_to_toml_string(&merged).map_err(io)?;
-    let current_toml = config_to_toml_string(&current).unwrap_or_default();
+    let overlay_path = crate::codex_overlay::overlay_state_path(backup_dir);
+    let current = read_toml(config_path);
+    let baseline_overlay =
+        match crate::codex_overlay::read_overlay_state(&overlay_path).map_err(io)? {
+            Some(state) => Some(state),
+            None => Some(crate::codex_overlay::new_baseline(config_path).map_err(io)?),
+        };
+    let provider_ready = current.get("model_provider").and_then(|v| v.as_str())
+        == Some(crate::codex_overlay::PROVIDER_ID)
+        && current.get("model").and_then(|v| v.as_str()) == Some(provider.model.as_str())
+        && catalog_path.exists();
     let snapshots = live_snapshots(&[
         config_path.to_path_buf(),
         catalog_path.clone(),
-        codex_home.join("auth.json"),
-        codex_home.join(AUTH_OFFICIAL_BAK),
         providers_path.to_path_buf(),
+        overlay_path,
     ])?;
     let outcome = (|| {
-        let config_written = if new_toml != current_toml {
+        let config_written = if !provider_ready {
             let purpose = if already.is_null() {
                 "pre-host"
             } else {
                 "pre-switch"
             };
             backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
-            write_toml(config_path, &merged).map_err(io)?;
-            true
+            let before = crate::codex_overlay::fingerprint(config_path).map_err(io)?;
+            let after = crate::codex_overlay::apply_gateway(
+                config_path,
+                GATEWAY_BASE_URL,
+                &provider.model,
+                &catalog_path.to_string_lossy(),
+                before.sha256.as_deref(),
+            )
+            .map_err(io)?;
+            before.sha256 != after.sha256
         } else {
             false
         };
@@ -565,128 +457,29 @@ pub fn host(
             .map_err(|e| e.to_string())
             .map_err(io)?;
 
-        let (auth_changed, backup_created) = if has_off {
-            (false, false)
-        } else {
-            ensure_auth_key(codex_home, &provider.api_key).map_err(io)?
-        };
+        crate::codex_overlay::record_applied_state(
+            config_path,
+            backup_dir,
+            baseline_overlay,
+            Some(&catalog_path),
+        )
+        .map_err(io)?;
 
         set_active_checked(providers_path, &provider, "codex")?;
+        let login = crate::codex_security::probe_login_cached(codex_home);
 
         Ok(json!({
             "hosted": true, "switched": false,
-            "hasOfficial": has_off,
+            "hasOfficial": login.state == crate::codex_security::LoginState::SignedIn,
+            "login": login,
             "hosting": detect_hosting(config_path, providers_path),
-            "changed": { "config": config_written, "auth": auth_changed, "authBackup": backup_created },
+            "changed": { "config": config_written, "auth": false, "authBackup": false },
         }))
     })();
     outcome.map_err(|error| rollback_files(error, &snapshots))
 }
 
 // ── unhost ───────────────────────────────────────────────────
-
-/// 移除 custom 段及关联字段(model_provider/model/model_catalog_json),其余保留。
-fn build_unhosted_config(current: &Value) -> Value {
-    let mut cfg = current.clone();
-    let obj = cfg.as_object_mut().expect("config 不是 object");
-    obj.remove("model_provider");
-    obj.remove("model");
-    obj.remove("model_catalog_json");
-    if let Some(mp) = obj
-        .get_mut("model_providers")
-        .and_then(|v| v.as_object_mut())
-    {
-        mp.remove("custom");
-        if mp.is_empty() {
-            obj.remove("model_providers");
-        }
-    }
-    cfg
-}
-
-/// 从 pre-host 快照恢复受控字段(§1.5-1):model_provider/model/model_catalog_json/custom 段
-/// 取快照值,其余字段保留当前。快照无某字段则移除之。
-fn restore_controlled_from_snapshot(current: &Value, snapshot: &Value) -> Value {
-    let mut cfg = current.clone();
-    let obj = cfg.as_object_mut().expect("config 不是 object");
-    for k in ["model_provider", "model", "model_catalog_json"] {
-        match snapshot.get(k) {
-            Some(v) if !v.is_null() => {
-                obj.insert(k.into(), v.clone());
-            }
-            _ => {
-                obj.remove(k);
-            }
-        }
-    }
-    let mut mp = current.get("model_providers").cloned().unwrap_or(json!({}));
-    if let Some(m) = mp.as_object_mut() {
-        m.remove("custom");
-    }
-    if let Some(sp) = snapshot
-        .get("model_providers")
-        .and_then(|x| x.get("custom"))
-    {
-        if let Some(m) = mp.as_object_mut() {
-            m.insert("custom".into(), sp.clone());
-        }
-    }
-    let mp_empty = mp.as_object().map(|m| m.is_empty()).unwrap_or(true);
-    if mp_empty {
-        obj.remove("model_providers");
-    } else {
-        obj.insert("model_providers".into(), mp);
-    }
-    cfg
-}
-
-/// 找 backup_dir 里用途为 pre-host 的最新快照(host 前 config)。无则 None。
-fn find_pre_host_snapshot(backup_dir: &Path, config_path: &Path) -> Option<Value> {
-    let mut candidates: Vec<(Option<std::time::SystemTime>, Value)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(backup_dir) {
-        for e in rd.flatten() {
-            let manifest = e.path();
-            let name = manifest.file_name()?.to_string_lossy();
-            if !name.ends_with(".manifest.json") {
-                continue;
-            }
-            let meta: Value =
-                serde_json::from_str(&std::fs::read_to_string(&manifest).ok()?).ok()?;
-            if meta.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
-                continue;
-            }
-            if !crate::config::backup_matches_target(&manifest, config_path) {
-                continue;
-            }
-            let toml_path = manifest.with_file_name(name.trim_end_matches(".manifest.json"));
-            let v = match crate::config::read_verified_backup(&toml_path, config_path) {
-                Ok(Some(data)) => toml::from_str::<toml::Value>(&String::from_utf8_lossy(&data))
-                    .map(|value| serde_json::to_value(value).unwrap_or_else(|_| json!({})))
-                    .unwrap_or_else(|_| json!({})),
-                Ok(None) => json!({}),
-                Err(_) => continue,
-            };
-            candidates.push((e.metadata().and_then(|m| m.modified()).ok(), v));
-        }
-    }
-    candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts)); // 最新在前
-    candidates.into_iter().next().map(|(_, v)| v)
-}
-
-/// auth.json 里移除我们写入的 OPENAI_API_KEY(仅当值匹配最后一次托管供应商的 key;无 .bak 时的兜底)。
-fn remove_auth_key_if_ours(codex_home: &Path, api_key: &str) -> Result<bool, String> {
-    let auth_p = codex_home.join("auth.json");
-    let mut existing = read_auth_json(&auth_p);
-    let matches = existing.get("OPENAI_API_KEY").and_then(|v| v.as_str()) == Some(api_key);
-    if matches {
-        if let Some(o) = existing.as_object_mut() {
-            o.remove("OPENAI_API_KEY");
-            write_auth_json(&auth_p, &existing)?;
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
 
 /// POST /api/desktop/unhost
 pub fn unhost(
@@ -699,83 +492,64 @@ pub fn unhost(
 
     let hosting = detect_hosting(config_path, providers_path);
     if hosting.is_null() {
-        // 未托管(或第三方手写 custom 段,不属于我们)→ 幂等 no-op
         return Ok(json!({ "restored": false, "alreadyClean": true }));
     }
-
-    if has_official(codex_home) {
-        let snapshots = live_snapshots(&[
-            config_path.to_path_buf(),
-            codex_home.join("auth.json"),
-            codex_home.join(MODEL_CATALOG_FILENAME),
-            providers_path.to_path_buf(),
-        ])?;
-        let outcome = (|| {
-            backup_file(
-                config_path,
-                backup_dir,
-                "config-apply",
-                "pre-activate-official",
-            )
-            .map_err(|e| (500, "E_IO".to_string(), e))?;
-            crate::config::activate_official(config_path, backup_dir, providers_path, codex_home)
-                .map_err(|e| (500, "E_IO".to_string(), e))?;
-            let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
-            if catalog_path.exists() {
-                std::fs::remove_file(&catalog_path)
-                    .map_err(|e| (500, "E_IO".to_string(), e.to_string()))?;
-            }
-            clear_active_checked(providers_path, "codex")?;
-            Ok(json!({ "restored": true, "way": "official" }))
-        })();
-        return outcome.map_err(|error| rollback_files(error, &snapshots));
-    }
-
-    // 无官方账号:移除托管痕迹。优先从 pre-host 快照恢复受控字段(§1.5-1,opencode 等手写
-    // 用户的配置得以还原);无快照才清除。
-    let active = crate::providers::get_active_for_agent(providers_path, "codex");
-    let current = read_toml(config_path);
-    let merged = match find_pre_host_snapshot(backup_dir, config_path) {
-        Some(snapshot) => restore_controlled_from_snapshot(&current, &snapshot),
-        None => build_unhosted_config(&current),
-    };
-    let new_toml = config_to_toml_string(&merged).map_err(io)?;
-    let current_toml = config_to_toml_string(&current).unwrap_or_default();
     let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+    let overlay_path = crate::codex_overlay::overlay_state_path(backup_dir);
     let snapshots = live_snapshots(&[
         config_path.to_path_buf(),
         catalog_path.clone(),
-        codex_home.join("auth.json"),
         providers_path.to_path_buf(),
+        overlay_path.clone(),
     ])?;
     let outcome = (|| {
-        let config_written = if new_toml != current_toml {
-            backup_file(config_path, backup_dir, "config-apply", "pre-unhost").map_err(io)?;
-            write_toml(config_path, &merged).map_err(io)?;
-            true
+        backup_file(config_path, backup_dir, "config-apply", "pre-unhost").map_err(io)?;
+        let new_provider = read_toml(config_path)
+            .get("model_provider")
+            .and_then(|value| value.as_str())
+            == Some(crate::codex_overlay::PROVIDER_ID);
+        let (config_written, conflicts) = if new_provider {
+            let result =
+                crate::codex_overlay::restore_owned_fields(config_path, &overlay_path, None)
+                    .map_err(io)?;
+            let conflicts: Vec<String> = result["conflicts"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (result["changed"].as_bool().unwrap_or(false), conflicts)
         } else {
-            false
+            return Err((
+                409,
+                "E_OVERLAY_STATE_MISSING".into(),
+                "检测到旧版或外部 Codex 路由，但没有 2xapi ownership sidecar；请先使用官方默认恢复预览，不会自动删除 custom 配置".into(),
+            ));
         };
-        if catalog_path.exists() {
+        let catalog_owned = crate::codex_overlay::read_overlay_state(&overlay_path)
+            .map_err(io)?
+            .and_then(|state| state.catalog)
+            .and_then(|expected| {
+                crate::codex_overlay::fingerprint(&catalog_path)
+                    .ok()
+                    .map(|actual| expected.sha256 == actual.sha256)
+            })
+            .unwrap_or(false);
+        if catalog_owned && catalog_path.exists() {
             std::fs::remove_file(&catalog_path).map_err(|e| io(e.to_string()))?;
         }
-
-        let auth_restored = if codex_home.join(AUTH_OFFICIAL_BAK).exists() {
-            let data =
-                std::fs::read(codex_home.join(AUTH_OFFICIAL_BAK)).map_err(|e| io(e.to_string()))?;
-            std::fs::write(codex_home.join("auth.json"), &data).map_err(|e| io(e.to_string()))?;
-            true
-        } else if let Some(p) = &active {
-            remove_auth_key_if_ours(codex_home, &p.api_key).map_err(io)?
-        } else {
-            false
-        };
-
+        if overlay_path.exists() {
+            std::fs::remove_file(&overlay_path).map_err(|e| io(e.to_string()))?;
+        }
         clear_active_checked(providers_path, "codex")?;
 
         Ok(json!({
             "restored": true, "way": "clean",
-            "changed": { "config": config_written, "auth": auth_restored },
+            "conflicts": conflicts,
+            "changed": { "config": config_written, "catalog": catalog_owned, "auth": false },
         }))
     })();
     outcome.map_err(|error| rollback_files(error, &snapshots))
@@ -1009,43 +783,15 @@ mod tests {
         .unwrap();
     }
 
-    // ── hasOfficial 三态 ──
-
-    #[test]
-    fn has_official_three_states() {
-        let (_r, _c, _b, home, _p) = sandbox("auth3");
-        // 不存在 → false
-        assert!(!has_official(&home));
-        // 仅 OPENAI_API_KEY → false
-        std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap();
-        assert!(!has_official(&home));
-        // 官方 OAuth(tokens 对象)→ true
-        std::fs::write(
-            home.join("auth.json"),
-            r#"{"tokens":{"id_token":"a","access_token":"b"}}"#,
-        )
-        .unwrap();
-        assert!(has_official(&home));
-        // 两者并存(混入后常见)→ true
-        std::fs::write(
-            home.join("auth.json"),
-            r#"{"OPENAI_API_KEY":"sk-x","tokens":{"access_token":"b"}}"#,
-        )
-        .unwrap();
-        assert!(has_official(&home));
-        // 坏 JSON → false
-        std::fs::write(home.join("auth.json"), "not json").unwrap();
-        assert!(!has_official(&home));
-    }
-
     // ── host(gateway)写入快照 ──
 
     #[test]
     fn host_gateway_writes_expected_config() {
         let (root, cfg, bk, home, prov) = sandbox("host-gw");
         std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
-        // host 前已有 auth.json(别家 key)→ 应被备份
-        std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-old"}"#).unwrap();
+        // host 前已有 auth.json(别家 key)→ 必须完全不触碰
+        let auth_before = r#"{"OPENAI_API_KEY":"sk-old"}"#;
+        std::fs::write(home.join("auth.json"), auth_before).unwrap();
         let mut p = provider("p1", "2xapi");
         p.models = vec![crate::providers::ModelConfig {
             name: "gpt-demo".into(),
@@ -1058,7 +804,7 @@ mod tests {
 
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("model_provider = \"custom\""));
+        assert!(written.contains("model_provider = \"2xapi_gateway\""));
         assert!(
             written.contains("base_url = \"http://127.0.0.1:8787\""),
             "custom 段应指向网关:\n{written}"
@@ -1085,17 +831,12 @@ mod tests {
             crate::providers::load(&prov).active_provider_id,
             Some("p1".into())
         );
-        // auth:无账号 → key 写入 + host 前状态备份
-        let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
-        assert!(auth.contains("sk-test-secret"));
-        assert!(
-            home.join(AUTH_OFFICIAL_BAK).exists(),
-            "应备份 host 前的 auth.json"
-        );
         assert_eq!(
-            std::fs::read_to_string(home.join(AUTH_OFFICIAL_BAK)).unwrap(),
-            r#"{"OPENAI_API_KEY":"sk-old"}"#
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            auth_before
         );
+        assert!(!home.join("auth.json.official.bak").exists());
+        assert!(bk.join("2xapi-codex-overlay-state.json").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1106,19 +847,43 @@ mod tests {
         std::fs::write(home.join("auth.json"), official_auth).unwrap();
         write_providers(&prov, vec![provider("p1", "2xapi")]);
 
-        let out = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
-        assert!(out["hasOfficial"].as_bool().unwrap());
+        let _out = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         let written = std::fs::read_to_string(&cfg).unwrap();
         assert!(
-            written.contains("requires_openai_auth = true"),
-            "有账号应混入:\n{written}"
+            written.contains("requires_openai_auth = false"),
+            "gateway 不依赖官方登录:\n{written}"
         );
         // auth.json 原样、无备份
         assert_eq!(
             std::fs::read_to_string(home.join("auth.json")).unwrap(),
             official_auth
         );
-        assert!(!home.join(AUTH_OFFICIAL_BAK).exists());
+        assert!(!home.join("auth.json.official.bak").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_switch_unhost_preserves_auth_bytes_and_metadata() {
+        let (root, cfg, bk, home, prov) = sandbox("auth-invariant");
+        let auth_path = home.join("auth.json");
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"opaque-test"}}"#).unwrap();
+        let before_bytes = std::fs::read(&auth_path).unwrap();
+        let before_meta = std::fs::metadata(&auth_path).unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let after_meta = std::fs::metadata(&auth_path).unwrap();
+        assert_eq!(std::fs::read(&auth_path).unwrap(), before_bytes);
+        assert_eq!(before_meta.len(), after_meta.len());
+        assert_eq!(
+            before_meta.permissions().readonly(),
+            after_meta.permissions().readonly()
+        );
+        assert_eq!(
+            before_meta.modified().unwrap(),
+            after_meta.modified().unwrap()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1177,207 +942,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── host(direct,UI 对齐批放开:仅无官方账号)──
-
-    /// ① 无账号 host direct:custom 直指供应商,key 以 experimental_bearer_token 落盘
-    /// (阶段 1 实测 Bearer 字段),requires_openai_auth=false,active 生效,不动 auth.json。
-    #[test]
-    fn host_direct_writes_expected_config() {
-        let (root, cfg, bk, home, prov) = sandbox("host-direct");
-        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-
-        let out = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        assert!(out["hosted"].as_bool().unwrap());
-        assert!(!out["hasOfficial"].as_bool().unwrap());
-        assert_eq!(out["hosting"]["way"], "direct");
-        assert_eq!(out["hosting"]["providerId"], "p1");
-
-        let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("model_provider = \"custom\""));
-        assert!(
-            written.contains("model = \"gpt-demo\""),
-            "默认模型应写入:\n{written}"
-        );
-        assert!(
-            written.contains("base_url = \"https://up.example.com\""),
-            "custom 应直指供应商:\n{written}"
-        );
-        assert!(written.contains("wire_api = \"responses\""));
-        assert!(written.contains("requires_openai_auth = false"));
-        assert!(
-            written.contains("experimental_bearer_token = \"sk-test-secret\""),
-            "direct=Key 落盘(阶段 1 定稿差异,与网关零 Key 相反):\n{written}"
-        );
-        assert!(
-            !written.contains("127.0.0.1:8787"),
-            "direct 不经网关:\n{written}"
-        );
-        assert!(
-            written.contains("my_custom_setting"),
-            "用户字段应保留:\n{written}"
-        );
-        assert_eq!(
-            crate::providers::load(&prov).active_provider_id,
-            Some("p1".into())
-        );
-        // direct 不动 auth(bearer 已在 config):不创建 auth.json、不留备份
-        assert!(!home.join("auth.json").exists());
-        assert!(!home.join(AUTH_OFFICIAL_BAK).exists());
-        // 首次 direct 托管留 pre-host 快照(unhost 据此还原)
-        assert!(find_pre_host_snapshot(&bk, &cfg).is_some());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ② 幂等:重复 host 同供应商 + direct → no-op 200,config 不变。
-    #[test]
-    fn host_direct_idempotent_same_provider() {
-        let (root, cfg, bk, home, prov) = sandbox("host-direct-idem");
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        let r1 = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        assert!(r1["changed"]["config"].as_bool().unwrap());
-        let before = std::fs::read_to_string(&cfg).unwrap();
-        let r2 = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        assert!(r2["hosted"].as_bool().unwrap(), "重复 host 应 200 no-op");
-        assert!(
-            !r2["changed"]["config"].as_bool().unwrap(),
-            "config 不应重写"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&cfg).unwrap(),
-            before,
-            "config 不应变化"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ③ 有官方账号 host direct → 4xx E_DIRECT_UNAVAILABLE,config 一字不落(阶段 5 实测后再放开)。
-    #[test]
-    fn host_direct_rejected_with_official() {
-        let (root, cfg, bk, home, prov) = sandbox("host-direct-official");
-        std::fs::write(
-            home.join("auth.json"),
-            r#"{"tokens":{"id_token":"official"}}"#,
-        )
-        .unwrap();
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        let err = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap_err();
-        assert_eq!(err.0, 400);
-        assert_eq!(err.1, "E_DIRECT_UNAVAILABLE");
-        assert!(!err.2.is_empty(), "4xx 消息须为人话,不可为空");
-        assert!(!cfg.exists(), "被拒的 host 不应写 config");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 反向换路:direct 托管 → host gateway → unhost 仍还原到最初 pre-host
-    /// (gateway 全量写在已托管态用 pre-switch 备份,不把 direct 态快照成 pre-host,
-    /// 否则 unhost 会"还原"回带 key 的 direct 配置、托管态解不开)。
-    #[test]
-    fn host_gateway_from_direct_keeps_pre_host_snapshot() {
-        let (root, cfg, bk, home, prov) = sandbox("direct-back");
-        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        let _r = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
-        assert_eq!(detect_hosting(&cfg, &prov)["way"], "gateway");
-
-        unhost(&cfg, &bk, &home, &prov).unwrap();
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        assert!(
-            after.contains("my_custom_setting"),
-            "应还原到最初 pre-host 而非 direct 态:\n{after}"
-        );
-        assert!(!after.contains("experimental_bearer_token"));
-        assert!(!after.contains("[model_providers.custom]"));
-        assert!(
-            detect_hosting(&cfg, &prov).is_null(),
-            "unhost 后不应残留托管态:\n{}",
-            detect_hosting(&cfg, &prov)
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ④ state 检测:direct 托管后 hosting={way:"direct", providerId, providerName}。
-    #[test]
-    fn state_reports_direct_hosting() {
-        let (root, cfg, bk, home, prov) = sandbox("state-direct");
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        let s = state(&cfg, &prov, &home);
-        assert!(!s["hasOfficial"].as_bool().unwrap());
-        assert_eq!(s["hosting"]["way"], "direct", "state 应报 direct:\n{s}");
-        assert_eq!(s["hosting"]["providerId"], "p1");
-        assert_eq!(s["hosting"]["providerName"], "2xapi");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ⑤ unhost 清理 direct 托管:experimental_bearer_token 随 custom 段一并清除,幂等。
-    #[test]
-    fn unhost_cleans_direct_hosting() {
-        let (root, cfg, bk, home, prov) = sandbox("unhost-direct");
-        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-
-        let out = unhost(&cfg, &bk, &home, &prov).unwrap();
-        assert!(out["restored"].as_bool().unwrap());
-        let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(
-            !written.contains("experimental_bearer_token"),
-            "bearer 应随 custom 段清理:\n{written}"
-        );
-        assert!(!written.contains("[model_providers.custom]"));
-        assert!(!written.contains("model_provider ="));
-        assert!(
-            !written.contains("sk-test-secret"),
-            "key 不应残留:\n{written}"
-        );
-        assert!(
-            written.contains("my_custom_setting"),
-            "用户字段应保留:\n{written}"
-        );
-        assert!(crate::providers::load(&prov).active_provider_id.is_none());
-        // 幂等
-        let out2 = unhost(&cfg, &bk, &home, &prov).unwrap();
-        assert!(out2["alreadyClean"].as_bool().unwrap());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 换路:gateway 托管 → host direct → custom 段切到供应商直连;unhost 仍还原到
-    /// 最初 pre-host 快照(pre-switch 备份不污染快照链)。
-    #[test]
-    fn host_direct_switch_from_gateway_and_unhost_restores() {
-        let (root, cfg, bk, home, prov) = sandbox("direct-switch");
-        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
-        write_providers(&prov, vec![provider("p1", "2xapi")]);
-        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
-        assert_eq!(detect_hosting(&cfg, &prov)["way"], "gateway");
-
-        let r = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
-        assert!(
-            r["switched"].as_bool().unwrap(),
-            "已托管态换路应报 switched"
-        );
-        let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(
-            written.contains("base_url = \"https://up.example.com\""),
-            "custom 应切到供应商直连:\n{written}"
-        );
-        assert!(written.contains("experimental_bearer_token = \"sk-test-secret\""));
-        assert_eq!(detect_hosting(&cfg, &prov)["way"], "direct");
-
-        // unhost 还原到最初 pre-host(用户原始字段回来,bearer 不残留)
-        unhost(&cfg, &bk, &home, &prov).unwrap();
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        assert!(
-            after.contains("my_custom_setting"),
-            "应还原到最初 pre-host:\n{after}"
-        );
-        assert!(!after.contains("experimental_bearer_token"));
-        assert!(!after.contains("[model_providers.custom]"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[test]
     fn host_idempotent_same_provider() {
         let (root, cfg, bk, home, prov) = sandbox("host-idem");
@@ -1406,34 +970,34 @@ mod tests {
         write_providers(&prov, vec![p1, p2]);
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         let before = std::fs::read_to_string(&cfg).unwrap();
-        let custom_before: String = before
-            .split("[model_providers.custom]")
+        let gateway_before: String = before
+            .split("[model_providers.2xapi_gateway]")
             .nth(1)
             .unwrap()
             .to_string();
         let r = host(&cfg, &bk, &home, &prov, "p2", "gateway").unwrap();
         assert!(r["switched"].as_bool().unwrap());
         let after = std::fs::read_to_string(&cfg).unwrap();
-        let custom_after: String = after
-            .split("[model_providers.custom]")
+        let gateway_after: String = after
+            .split("[model_providers.2xapi_gateway]")
             .nth(1)
             .unwrap()
             .lines()
             .take(5)
             .collect::<String>();
         assert!(
-            after.contains("[model_providers.custom]")
+            after.contains("[model_providers.2xapi_gateway]")
                 && after.contains("base_url = \"http://127.0.0.1:8787\""),
-            "custom 段应保留(网关指向不变):\n{after}"
+            "gateway 段应保留(网关指向不变):\n{after}"
         );
         assert!(
             after.contains("model = \"model-b\""),
             "换供应商应同步 model(真机故障:旧模型名发给新上游):\n{after}"
         );
         assert_eq!(
-            custom_before.lines().take(5).collect::<String>(),
-            custom_after,
-            "custom 段内容不应变化"
+            gateway_before.lines().take(5).collect::<String>(),
+            gateway_after,
+            "gateway 段内容不应变化"
         );
         assert_eq!(
             crate::providers::load(&prov).active_provider_id,
@@ -1510,6 +1074,19 @@ mod tests {
             detect_hosting(&cfg, &prov).is_null(),
             "第三方 custom 不应误判为托管"
         );
+        // 非活动 provider 段即使带旧标记，也不能被当成当前托管。
+        std::fs::write(
+            &cfg,
+            "model_provider = \"openai\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\nexperimental_bearer_token = \"opaque\"\n",
+        )
+        .unwrap();
+        assert!(detect_hosting(&cfg, &prov).is_null());
+        std::fs::write(
+            &cfg,
+            "[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\nexperimental_bearer_token = \"opaque\"\n",
+        )
+        .unwrap();
+        assert!(detect_hosting(&cfg, &prov).is_null());
         // 真机暴露场景:用户手写 custom 地址恰与 active 供应商地址相同但无 bearer 标记键
         // → 仍应 null(UI2 已定:detect 禁止地址匹配,仅有我们写入的
         // experimental_bearer_token 键才算 direct 托管)
@@ -1531,8 +1108,8 @@ mod tests {
             "gateway",
             "网关地址优先于 bearer 标记"
         );
-        // gateway 托管 + active
-        std::fs::write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n").unwrap();
+        // 新版 gateway 托管 + active：独占 provider 才能被识别
+        std::fs::write(&cfg, "model_provider = \"2xapi_gateway\"\n[model_providers.2xapi_gateway]\nbase_url = \"http://127.0.0.1:8787\"\n").unwrap();
         crate::providers::set_active(&prov, "p1");
         let h = detect_hosting(&cfg, &prov);
         assert_eq!(h["way"], "gateway");
@@ -1570,10 +1147,10 @@ mod tests {
             "无 auth.json → hasOfficial false"
         );
         assert_eq!(s["gateway"]["addr"], GATEWAY_ADDR);
-        // 此前托管过、后来清空供应商 → config 残留网关 custom 段,仍必须未托管(null)
+        // 此前托管过、后来清空供应商 → config 残留网关段,仍必须未托管(null)
         std::fs::write(
             &cfg,
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n",
+            "model_provider = \"2xapi_gateway\"\n[model_providers.2xapi_gateway]\nbase_url = \"http://127.0.0.1:8787\"\n",
         )
         .unwrap();
         let s2 = state(&cfg, &prov, &home);
@@ -1603,12 +1180,12 @@ mod tests {
         assert!(out["restored"].as_bool().unwrap());
         assert_eq!(out["way"], "clean");
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(!written.contains("[model_providers.custom]"));
+        assert!(!written.contains("[model_providers.2xapi_gateway]"));
         assert!(!written.contains("model_provider ="));
         assert!(!written.contains("model_catalog_json"));
         assert!(!written.contains("model ="));
         assert!(!home.join(MODEL_CATALOG_FILENAME).exists());
-        // auth 回到 host 前的别家 key
+        // auth 必须回到 host 前的别家 key（且从未被 2xapi 写入）
         assert_eq!(
             std::fs::read_to_string(home.join("auth.json")).unwrap(),
             r#"{"OPENAI_API_KEY":"sk-other-vendor"}"#
@@ -1632,10 +1209,10 @@ mod tests {
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
 
         let out = unhost(&cfg, &bk, &home, &prov).unwrap();
-        assert_eq!(out["way"], "official");
+        assert_eq!(out["way"], "clean");
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("model_provider = \"openai\""));
-        assert!(!written.contains("[model_providers.custom]"));
+        assert!(!written.contains("model_provider ="));
+        assert!(!written.contains("[model_providers.2xapi_gateway]"));
         assert!(std::fs::read_to_string(home.join("auth.json"))
             .unwrap()
             .contains("OFFICIAL"));
@@ -1643,19 +1220,13 @@ mod tests {
     }
 
     #[test]
-    fn unhost_without_bak_removes_only_our_key() {
+    fn unhost_without_auth_does_not_create_or_remove_auth() {
         let (root, cfg, bk, home, prov) = sandbox("unhost-nobak");
-        // host 前无 auth.json → 无 .bak;host 后 auth 只有我们写的 key
+        // host 前无 auth.json，网关托管和恢复都不得创建 auth.json
         write_providers(&prov, vec![provider("p1", "A")]);
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
-        assert!(!home.join(AUTH_OFFICIAL_BAK).exists());
-
         unhost(&cfg, &bk, &home, &prov).unwrap();
-        let auth = read_auth_json(&home.join("auth.json"));
-        assert!(
-            auth.get("OPENAI_API_KEY").is_none(),
-            "我们写的 key 应被移除:\n{auth}"
-        );
+        assert!(!home.join("auth.json").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1689,12 +1260,8 @@ mod tests {
         .unwrap();
         write_providers(&prov, vec![provider("p1", "A")]);
 
-        // host 产生 pre-host 快照
+        // host 产生 ownership sidecar；custom 作为用户配置保持不动
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
-        assert!(
-            find_pre_host_snapshot(&bk, &cfg).is_some(),
-            "host 应留下 pre-host 快照"
-        );
 
         // unhost → 受控字段恢复为快照(opencode 配置回来)
         let out = unhost(&cfg, &bk, &home, &prov).unwrap();

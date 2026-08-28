@@ -6,7 +6,7 @@
 
 ## 0. 前置确认
 - 已修 `from_std` 运行期 panic（`main.rs` 绑定 8787 后 `set_nonblocking(true)`）。**旧 release 二进制必须重建**，否则启动即崩。
-- 后端 35 个单测全绿；真实 DeepSeek（ChatCompletions 模式）非流式/流式/诊断/模型列表均已验证通过。
+- 旧版本的 35 个单测与真实 DeepSeek 验证记录保留作历史证据；当前版本请以本页末尾的 P0 验证记录为准。
 
 ---
 
@@ -76,3 +76,12 @@ config.toml 里 **不写** `experimental_bearer_token`（key 只由网关注入�
 - [x]（已自验）ChatCompletions 协议转换：非流式 + 流式 SSE
 - [x]（已自验）诊断三步、模型列表、config 预览==实际写入
 - [ ]（需你）真实 Codex 对话、热切换不重启、activate-official 恢复、per-provider 代理/超时
+
+## 7. P0 配置档案 / Doctor 2.0 / 会话任务控制（2026-08-28）
+
+- [x] 项目书与 API 契约已写入 `docs/01_产品概述与需求冻结.md`、`docs/04_接口设计.md`。
+- [x] Codex 配置档案：版本化 `2xapi-profiles.json`、原子写、预览令牌、配置与供应商 CAS、备份和失败回滚；档案不保存 key，应用不触碰 `auth.json`。
+- [x] Doctor 2.0：固定 `checks[]`、错误分类与脱敏、健康注册表、连续失败熔断/冷却/半开探测；Official 状态 bypass，不自动故障转移到第三方。
+- [x] 会话修复任务：预览、queued/running/cancelling/cancelled/completed/failed 生命周期、取消、检查点恢复、心跳/停滞提示、脱敏任务元数据持久化。
+- [x] 真实执行的验证：针对性 profile/session/doctor/server 测试通过；`cargo clippy --all-targets -- -D warnings`、前端 `node --check`、release build、OpenSpec strict 均通过。
+- [ ] 完整测试套件仍需在关闭本机 Cursor 后重跑；当前运行中的 Cursor 使既有 Cursor adapter 测试按设计返回 `E_CURSOR_RUNNING`，不是本次 P0 代码失败。

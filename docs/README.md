@@ -17,6 +17,7 @@
 | [05_里程碑任务清单与验收标准](05_里程碑任务清单与验收标准.md) | M0~M7 原子任务 + 每条 DoD + 用户验收 checklist | 每个里程碑的执行+验收依据 |
 | [06_前端页面设计](06_前端页面设计.md) | 每页 ASCII 布局 + 元素 + 交互 + API 映射 | M6 |
 | [07_API开发指令模板](07_API开发指令模板.md) | 通用 prompt 骨架 + 每里程碑填充卡 + CCR/交付块模板 | **人喂给 API 时用** |
+| [竞品吸收与 P0 变更](../openspec/changes/p0-config-profiles-doctor-session-control/proposal.md) | 配置档案、Provider Doctor 2.0、会话修复任务控制的规格、设计与实施任务 | 当前施工 |
 
 ---
 

@@ -8,6 +8,7 @@
 //! 本期只上「列表+修复+设置」,删除第二版(带备份恢复验证后再放)。
 
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -62,7 +63,8 @@ struct CatalogInfo {
     missing: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RepairJob {
     pub id: String,
     pub status: String,
@@ -74,6 +76,19 @@ pub struct RepairJob {
     pub backup_id: Option<String>,
     pub message: String,
     pub error: Option<String>,
+    pub skipped: u64,
+    pub failed: u64,
+    pub checkpoint: u64,
+    pub heartbeat_at: i64,
+    pub cancel_requested: bool,
+    #[serde(default)]
+    codex_home: PathBuf,
+    #[serde(default)]
+    backup_dir: PathBuf,
+    #[serde(default)]
+    target_provider: String,
+    #[serde(default)]
+    resume_from: u64,
 }
 
 #[derive(Default)]
@@ -92,6 +107,61 @@ static JOBS: LazyLock<Mutex<JobStore>> = LazyLock::new(|| Mutex::new(JobStore::d
 static DELETE_PLANS: LazyLock<Mutex<HashMap<String, DeletePlan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static HISTORY_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static REPAIR_PREVIEWS: LazyLock<Mutex<HashMap<String, (String, i64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn job_file(codex_home: &Path, id: &str) -> Option<PathBuf> {
+    uuid::Uuid::parse_str(id).ok().map(|_| {
+        codex_home
+            .join("2xapi-session-jobs")
+            .join(format!("{id}.json"))
+    })
+}
+
+fn persist_job(job: &RepairJob) {
+    let Some(path) = job_file(&job.codex_home, &job.id) else {
+        return;
+    };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(raw) = serde_json::to_vec_pretty(job) else {
+        return;
+    };
+    let tmp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    if std::fs::write(&tmp, raw).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::rename(&tmp, path);
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+fn load_persisted_job(codex_home: &Path, id: &str) -> Option<RepairJob> {
+    let path = job_file(codex_home, id)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut job: RepairJob = serde_json::from_str(&raw).ok()?;
+    // 进程重启后，running/cancelling 任务不可能安全续接线程；标记为可恢复失败。
+    if matches!(job.status.as_str(), "running" | "cancelling" | "queued") {
+        job.status = "failed".into();
+        job.phase = "interrupted".into();
+        job.error = Some("应用重启导致任务中断，可点击恢复".into());
+        job.message = "任务被中断，可点击恢复".into();
+        job.cancel_requested = false;
+    }
+    Some(job)
+}
 
 fn valid_rollout_path(codex_home: &Path, raw: &str) -> Option<PathBuf> {
     let raw = raw.trim().trim_start_matches("\\?/");
@@ -367,7 +437,28 @@ fn codex_running() -> bool {
             .status()
             .is_ok_and(|status| status.success())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        ["codex.exe", "ChatGPT.exe"].iter().any(|image| {
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+                .output()
+                .ok()
+                .is_some_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .to_ascii_lowercase()
+                        .contains(&image.to_ascii_lowercase())
+                })
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("pgrep")
+            .args(["-f", "codex([[:space:]].*)?app-server"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
     {
         false
     }
@@ -568,12 +659,14 @@ fn session_meta_record(path: &Path, expected_id: &str) -> Result<Value, String> 
             continue;
         }
         let payload = value.get("payload").and_then(Value::as_object);
-        let id = payload
-            .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if id != expected_id {
-            return Err("rollout 中的会话 ID 与请求不一致".into());
+        let matches_expected = payload.is_some_and(|payload| {
+            payload.get("id").and_then(Value::as_str) == Some(expected_id)
+                || payload.get("session_id").and_then(Value::as_str) == Some(expected_id)
+        });
+        if !matches_expected {
+            // 一个 rollout 可能包含父会话/分叉会话的 session_meta。只要文件中
+            // 存在请求的会话，就不能把这些合法的关联记录当成损坏数据。
+            continue;
         }
         return Ok(json!({
             "path": path.to_string_lossy(),
@@ -581,7 +674,7 @@ fn session_meta_record(path: &Path, expected_id: &str) -> Result<Value, String> 
             "original": line,
         }));
     }
-    Err("rollout 缺少 session_meta".into())
+    Err("rollout 未找到请求的 session_meta".into())
 }
 
 fn write_json_private(path: &Path, value: &Value) -> Result<(), String> {
@@ -944,6 +1037,55 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
 
 // ── repair ─────────────────────────────────────────────────
 
+fn validate_target_provider(target_provider: &str) -> Result<(), String> {
+    if target_provider.trim().is_empty()
+        || !target_provider
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("同步目标 provider 非法".into());
+    }
+    Ok(())
+}
+
+pub fn preview_repair(codex_home: &Path, target_provider: &str) -> Result<Value, String> {
+    validate_target_provider(target_provider)?;
+    let sessions = user_session_infos(codex_home);
+    let token = uuid::Uuid::new_v4().to_string();
+    let expires_at = unix_now() + 300;
+    REPAIR_PREVIEWS
+        .lock()
+        .map_err(|_| "会话修复预览锁已损坏".to_string())?
+        .insert(token.clone(), (target_provider.trim().into(), expires_at));
+    let dbs: Vec<String> = [state_db_path(codex_home), catalog_db_path(codex_home)]
+        .into_iter()
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    Ok(json!({
+        "previewToken": token,
+        "expiresAt": expires_at,
+        "targetProvider": target_provider.trim(),
+        "total": sessions.len(),
+        "estimatedRollouts": sessions.len(),
+        "databases": dbs,
+        "backup": {"willCreate": true, "scope": "state/catalog/session_index/rollouts"},
+        "preserved": ["auth.json", "config.toml", "providers", "MCP", "plugins", "permissions"]
+    }))
+}
+
+pub fn validate_repair_preview(target_provider: &str, token: &str) -> Result<(), String> {
+    let (target, expires_at) = REPAIR_PREVIEWS
+        .lock()
+        .map_err(|_| "会话修复预览锁已损坏".to_string())?
+        .remove(token)
+        .ok_or_else(|| "修复预览不存在或已过期，请重新预览".to_string())?;
+    if expires_at < unix_now() || target != target_provider.trim() {
+        return Err("修复预览已过期或目标供应商已变化，请重新预览".into());
+    }
+    Ok(())
+}
+
 fn update_job(id: &str, phase: &str, processed: u64, total: u64, percent: u8, message: &str) {
     if let Ok(mut store) = JOBS.lock() {
         if let Some(job) = store.jobs.get_mut(id) {
@@ -952,6 +1094,9 @@ fn update_job(id: &str, phase: &str, processed: u64, total: u64, percent: u8, me
             job.total = total;
             job.percent = percent;
             job.message = message.into();
+            job.checkpoint = processed;
+            job.heartbeat_at = unix_now();
+            persist_job(job);
         }
     }
 }
@@ -967,18 +1112,75 @@ fn finish_job(id: &str, result: Result<(u64, String), String>) {
                     job.processed = job.total;
                     job.fixed = fixed;
                     job.backup_id = Some(backup_id);
-                    job.message = format!("修复完成，共更新 {fixed} 项");
+                    job.message = if job.failed > 0 {
+                        format!(
+                            "修复完成，共更新 {fixed} 项，跳过 {} 项，失败 {} 项",
+                            job.skipped, job.failed
+                        )
+                    } else {
+                        format!("修复完成，共更新 {fixed} 项，跳过 {} 项", job.skipped)
+                    };
+                    job.heartbeat_at = unix_now();
                 }
                 Err(error) => {
-                    job.status = "failed".into();
-                    job.phase = "failed".into();
-                    job.error = Some(error.clone());
-                    job.message = error;
+                    if job.cancel_requested || error == "任务已取消" {
+                        job.status = "cancelled".into();
+                        job.phase = "cancelled".into();
+                        job.error = None;
+                        job.message = "任务已取消，可点击恢复".into();
+                    } else {
+                        job.status = "failed".into();
+                        job.phase = "failed".into();
+                        // 失败任务不会继续轮询；清零进度，避免把最后一次阶段进度
+                        // （例如 49%）误显示成“仍然卡住”。
+                        job.processed = 0;
+                        job.total = 0;
+                        job.percent = 0;
+                        job.error = Some(error.clone());
+                        job.message = error;
+                    }
+                    job.heartbeat_at = unix_now();
                 }
             }
+            persist_job(job);
         }
         if store.active.as_deref() == Some(id) {
             store.active = None;
+        }
+    }
+}
+
+fn cancel_requested(id: &str) -> bool {
+    JOBS.lock()
+        .ok()
+        .and_then(|store| store.jobs.get(id).map(|job| job.cancel_requested))
+        .unwrap_or(false)
+}
+
+fn ensure_not_cancelled(id: &str) -> Result<(), String> {
+    if cancel_requested(id) {
+        Err("任务已取消".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn mark_item_failed(id: &str) {
+    if let Ok(mut store) = JOBS.lock() {
+        if let Some(job) = store.jobs.get_mut(id) {
+            job.failed = job.failed.saturating_add(1);
+            job.heartbeat_at = unix_now();
+            persist_job(job);
+        }
+    }
+}
+
+fn mark_item_skipped(id: &str) {
+    if let Ok(mut store) = JOBS.lock() {
+        if let Some(job) = store.jobs.get_mut(id) {
+            job.skipped = job.skipped.saturating_add(1);
+            job.heartbeat_at = unix_now();
+            persist_job(job);
         }
     }
 }
@@ -998,15 +1200,13 @@ fn replace_session_meta_provider(
         if let Ok(mut value) = serde_json::from_str::<Value>(&line) {
             if value.get("type").and_then(Value::as_str) == Some("session_meta") {
                 let payload = value.get_mut("payload").and_then(Value::as_object_mut);
-                let id = payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if id != thread_id {
-                    return Err("rollout 中的会话 ID 与目标不一致".into());
+                let matches_thread = payload.as_ref().is_some_and(|payload| {
+                    payload.get("id").and_then(Value::as_str) == Some(thread_id)
+                        || payload.get("session_id").and_then(Value::as_str) == Some(thread_id)
+                });
+                if matches_thread {
+                    found = true;
                 }
-                found = true;
                 if let Some(payload) = payload {
                     if payload.get("model_provider").and_then(Value::as_str) != Some(target) {
                         payload.insert("model_provider".into(), json!(target));
@@ -1020,7 +1220,7 @@ fn replace_session_meta_provider(
         lines.push(output);
     }
     if !found {
-        return Err("rollout 缺少 session_meta".into());
+        return Err("rollout 未找到目标 session_meta".into());
     }
     if !changed {
         return Ok(false);
@@ -1039,14 +1239,24 @@ fn replace_session_meta_provider(
     Ok(true)
 }
 
-fn sync_provider(codex_home: &Path, target: &str, job_id: &str) -> Result<u64, String> {
+fn sync_provider(
+    codex_home: &Path,
+    backup_dir: &Path,
+    target: &str,
+    job_id: &str,
+    resume_from: u64,
+) -> Result<u64, String> {
     let sessions = user_session_infos(codex_home);
     let total = sessions.len() as u64;
     let mut fixed = 0u64;
-    update_job(job_id, "rollout", 0, total, 20, "扫描历史会话");
-    for (index, (thread_id, info, _)) in sessions.iter().enumerate() {
-        if replace_session_meta_provider(&info.path, thread_id, target)? {
-            fixed += 1;
+    let start = (resume_from as usize).min(sessions.len());
+    update_job(job_id, "rollout", start as u64, total, 20, "扫描历史会话");
+    for (index, (thread_id, info, _)) in sessions.iter().enumerate().skip(start) {
+        ensure_not_cancelled(job_id)?;
+        match replace_session_meta_provider(&info.path, thread_id, target) {
+            Ok(true) => fixed += 1,
+            Ok(false) => mark_item_skipped(job_id),
+            Err(_) => mark_item_failed(job_id),
         }
         if index % 10 == 0 || index + 1 == sessions.len() {
             let percent = 20 + (((index + 1) as f64 / sessions.len().max(1) as f64) * 35.0) as u8;
@@ -1060,6 +1270,7 @@ fn sync_provider(codex_home: &Path, target: &str, job_id: &str) -> Result<u64, S
             );
         }
     }
+    ensure_not_cancelled(job_id)?;
     if let Some(path) = state_db_path(codex_home) {
         let conn =
             Connection::open(path).map_err(|error| format!("打开 state DB 失败: {error}"))?;
@@ -1072,6 +1283,7 @@ fn sync_provider(codex_home: &Path, target: &str, job_id: &str) -> Result<u64, S
             )
             .map_err(|error| format!("同步 state provider 失败: {error}"))? as u64;
     }
+    ensure_not_cancelled(job_id)?;
     update_job(job_id, "state", total, total, 68, "同步 state 数据库");
     if let Some(path) = catalog_db_path(codex_home) {
         let conn =
@@ -1089,14 +1301,16 @@ fn sync_provider(codex_home: &Path, target: &str, job_id: &str) -> Result<u64, S
             [],
         );
     }
+    ensure_not_cancelled(job_id)?;
     update_job(job_id, "catalog", total, total, 83, "同步 catalog 索引");
-    let repair = repair_sessions(codex_home, &codex_home.join("config-backups"));
+    let repair = repair_sessions(codex_home, backup_dir);
     if let Some(error) = repair.get("error").and_then(Value::as_str) {
         return Err(error.into());
     }
     fixed += repair.get("fixed").and_then(Value::as_u64).unwrap_or(0);
     let removed_ghosts = prune_ghost_session_index(codex_home)?;
     fixed += removed_ghosts;
+    ensure_not_cancelled(job_id)?;
     update_job(job_id, "verify", total, total, 95, "校验数据库完整性");
     for path in [state_db_path(codex_home), catalog_db_path(codex_home)]
         .into_iter()
@@ -1291,13 +1505,16 @@ pub fn start_repair_job(
     backup_dir: PathBuf,
     target_provider: String,
 ) -> Result<String, String> {
-    if target_provider.trim().is_empty()
-        || !target_provider
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    {
-        return Err("同步目标 provider 非法".into());
-    }
+    start_repair_job_from(codex_home, backup_dir, target_provider, 0)
+}
+
+fn start_repair_job_from(
+    codex_home: PathBuf,
+    backup_dir: PathBuf,
+    target_provider: String,
+    resume_from: u64,
+) -> Result<String, String> {
+    validate_target_provider(&target_provider)?;
     if codex_running() {
         return Err("Codex 正在运行，请先点击“重新打开 Codex”完成退出后再修复".into());
     }
@@ -1322,8 +1539,20 @@ pub fn start_repair_job(
                 backup_id: None,
                 message: "正在检查历史会话".into(),
                 error: None,
+                skipped: 0,
+                failed: 0,
+                checkpoint: resume_from,
+                heartbeat_at: unix_now(),
+                cancel_requested: false,
+                codex_home: codex_home.clone(),
+                backup_dir: backup_dir.clone(),
+                target_provider: target_provider.clone(),
+                resume_from,
             },
         );
+        if let Some(job) = store.jobs.get(&id) {
+            persist_job(job);
+        }
     }
     let job_id = id.clone();
     std::thread::spawn(move || {
@@ -1341,10 +1570,20 @@ pub fn start_repair_job(
                 true,
             )?;
             update_job(&job_id, "backup", 0, 0, 20, "备份完成");
-            match sync_provider(&codex_home, &target_provider, &job_id) {
+            match sync_provider(
+                &codex_home,
+                &backup_dir,
+                &target_provider,
+                &job_id,
+                resume_from,
+            ) {
                 Ok(fixed) => Ok((fixed, backup_id)),
                 Err(error) => {
-                    let _ = restore_history_backup(&codex_home, &backup_dir, &backup_id);
+                    // 取消发生在安全边界：已完成的单项修改保留，用户可从检查点恢复；
+                    // 只有非取消失败才整体回滚到修复前备份。
+                    if error != "任务已取消" {
+                        let _ = restore_history_backup(&codex_home, &backup_dir, &backup_id);
+                    }
                     Err(error)
                 }
             }
@@ -1368,7 +1607,62 @@ pub fn get_repair_job(id: &str) -> Option<Value> {
         "backupId": job.backup_id,
         "message": job.message,
         "error": job.error,
+        "skipped": job.skipped,
+        "failed": job.failed,
+        "checkpoint": job.checkpoint,
+        "heartbeatAt": job.heartbeat_at,
+        "cancelRequested": job.cancel_requested,
     }))
+}
+
+/// 从磁盘补载任务元数据，供应用重启后的状态查询使用。
+pub fn get_repair_job_for_home(codex_home: &Path, id: &str) -> Option<Value> {
+    if let Ok(mut store) = JOBS.lock() {
+        if !store.jobs.contains_key(id) {
+            if let Some(job) = load_persisted_job(codex_home, id) {
+                store.jobs.insert(id.to_string(), job);
+            }
+        }
+    }
+    get_repair_job(id)
+}
+
+pub fn cancel_repair_job(id: &str) -> Result<Value, String> {
+    let mut store = JOBS.lock().map_err(|_| "修复任务锁已损坏".to_string())?;
+    let job = store
+        .jobs
+        .get_mut(id)
+        .ok_or_else(|| "修复任务不存在".to_string())?;
+    if !matches!(job.status.as_str(), "running" | "queued" | "cancelling") {
+        return Err("任务已结束，不能取消".into());
+    }
+    job.cancel_requested = true;
+    job.status = "cancelling".into();
+    job.message = "正在取消，等待当前步骤安全退出".into();
+    job.heartbeat_at = unix_now();
+    persist_job(job);
+    Ok(json!({"id": id, "status": job.status, "message": job.message}))
+}
+
+/// 恢复失败或取消的任务。恢复会创建新任务并重新执行，所有写入仍受备份和幂等逻辑保护。
+pub fn resume_repair_job(id: &str) -> Result<String, String> {
+    let (codex_home, backup_dir, target_provider, checkpoint) = {
+        let store = JOBS.lock().map_err(|_| "修复任务锁已损坏".to_string())?;
+        let job = store
+            .jobs
+            .get(id)
+            .ok_or_else(|| "修复任务不存在".to_string())?;
+        if !matches!(job.status.as_str(), "cancelled" | "failed") {
+            return Err("只有失败或已取消的任务可以恢复".into());
+        }
+        (
+            job.codex_home.clone(),
+            job.backup_dir.clone(),
+            job.target_provider.clone(),
+            job.checkpoint,
+        )
+    };
+    start_repair_job_from(codex_home, backup_dir, target_provider, checkpoint)
 }
 
 pub fn preview_delete(codex_home: &Path, ids: &[String]) -> Result<Value, String> {
@@ -2007,7 +2301,7 @@ mod tests {
                 source_created_at REAL NOT NULL, source_updated_at REAL NOT NULL, cwd TEXT NOT NULL,
                 source_kind TEXT NOT NULL, source_detail TEXT, model_provider TEXT NOT NULL,
                 git_branch TEXT, observation_sequence INTEGER NOT NULL,
-                missing_candidate INTEGER NOT NULL DEFAULT 0,
+                missing_candidate INTEGER NOT NULL DEFAULT 0, thread_source TEXT,
                 PRIMARY KEY (host_id, thread_id));",
         )
         .unwrap();
@@ -2133,6 +2427,149 @@ mod tests {
             .unwrap();
         assert_eq!(missing, 0, "备份失败时不得继续修复写入");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provider_repair_accepts_forked_rollout_metadata() {
+        let (root, _bk) = sandbox("provider-fork");
+        let thread_id = "thread-current";
+        let parent_id = "thread-parent";
+        let rollout = root.join("sessions/2026/01/rollout.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"session_id\":\"{parent_id}\",\"model_provider\":\"custom\"}}}}\n{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{parent_id}\",\"model_provider\":\"custom\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(replace_session_meta_provider(&rollout, thread_id, "openai").unwrap());
+        let records: Vec<Value> = std::fs::read_to_string(&rollout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["payload"]["id"], thread_id);
+        assert_eq!(records[0]["payload"]["session_id"], parent_id);
+        assert_eq!(records[1]["payload"]["id"], parent_id);
+        assert!(records
+            .iter()
+            .all(|record| record["payload"]["model_provider"] == "openai"));
+        assert!(!replace_session_meta_provider(&rollout, thread_id, "openai").unwrap());
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn provider_repair_rejects_rollout_without_target_metadata() {
+        let (root, _bk) = sandbox("provider-no-target");
+        let rollout = root.join("sessions/2026/01/rollout.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let original = r#"{"type":"session_meta","payload":{"id":"other"}}"#;
+        std::fs::write(&rollout, format!("{original}\n")).unwrap();
+
+        let error = replace_session_meta_provider(&rollout, "target", "openai").unwrap_err();
+        assert!(error.contains("未找到目标 session_meta"));
+        assert_eq!(
+            std::fs::read_to_string(&rollout).unwrap(),
+            format!("{original}\n")
+        );
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_repair_job_clears_stale_progress() {
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        {
+            let mut store = JOBS.lock().unwrap();
+            store.jobs.insert(
+                id.clone(),
+                RepairJob {
+                    id: id.clone(),
+                    status: "running".into(),
+                    phase: "rollout".into(),
+                    processed: 49,
+                    total: 100,
+                    percent: 49,
+                    fixed: 0,
+                    backup_id: None,
+                    message: "同步会话文件".into(),
+                    error: None,
+                    skipped: 0,
+                    failed: 0,
+                    checkpoint: 49,
+                    heartbeat_at: unix_now(),
+                    cancel_requested: false,
+                    codex_home: PathBuf::new(),
+                    backup_dir: PathBuf::new(),
+                    target_provider: "openai".into(),
+                    resume_from: 0,
+                },
+            );
+        }
+
+        finish_job(&id, Err("模拟失败".into()));
+        let job = get_repair_job(&id).unwrap();
+        assert_eq!(job["status"], "failed");
+        assert_eq!(job["percent"], 0);
+        assert_eq!(job["processed"], 0);
+        assert_eq!(job["total"], 0);
+        assert_eq!(job["error"], "模拟失败");
+        JOBS.lock().unwrap().jobs.remove(&id);
+    }
+
+    #[test]
+    fn cancelling_job_is_terminal_and_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = JOBS.lock().unwrap();
+            store.jobs.insert(
+                id.clone(),
+                RepairJob {
+                    id: id.clone(),
+                    status: "running".into(),
+                    phase: "rollout".into(),
+                    processed: 2,
+                    total: 10,
+                    percent: 27,
+                    fixed: 1,
+                    backup_id: None,
+                    message: "同步会话文件".into(),
+                    error: None,
+                    skipped: 0,
+                    failed: 0,
+                    checkpoint: 2,
+                    heartbeat_at: unix_now(),
+                    cancel_requested: false,
+                    codex_home: dir.path().to_path_buf(),
+                    backup_dir: dir.path().join("backups"),
+                    target_provider: "openai".into(),
+                    resume_from: 0,
+                },
+            );
+        }
+        let requested = cancel_repair_job(&id).unwrap();
+        assert_eq!(requested["status"], "cancelling");
+        finish_job(&id, Err("任务已取消".into()));
+        let job = get_repair_job(&id).unwrap();
+        assert_eq!(job["status"], "cancelled");
+        assert_eq!(job["checkpoint"], 2);
+        assert_eq!(job["cancelRequested"], true);
+        JOBS.lock().unwrap().jobs.remove(&id);
+    }
+
+    #[test]
+    fn repair_preview_is_scoped_and_expires_by_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let preview = preview_repair(dir.path(), "openai").unwrap();
+        let token = preview["previewToken"].as_str().unwrap();
+        assert_eq!(preview["targetProvider"], "openai");
+        assert!(validate_repair_preview("openai", token).is_ok());
+        assert!(validate_repair_preview("openai", token).is_err());
     }
 
     #[test]
@@ -2366,5 +2803,73 @@ mod tests {
             .as_bool()
             .unwrap());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// tasks.md 4.5：修复任务核心链执行期间 config/provider/auth/MCP/plugin 零改动。
+    /// 与 job 线程完全相同的调用序（create_history_backup + sync_provider）。
+    #[test]
+    fn repair_preserves_config_provider_auth_mcp_plugin_invariants() {
+        let (root, backup_dir) = sandbox("invariants");
+        std::fs::write(
+            root.join("config.toml"),
+            "model = \"gpt-5\"\n\n[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"schema_version":1,"providers":[{"id":"p1","name":"A","base_url":"https://e.com/v1","api_key":"sk-x"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("auth.json"),
+            r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"at","refresh_token":"rt","id_token":"it"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("plugins/demo")).unwrap();
+        let plugin_file = root.join("plugins/demo/plugin.json");
+        std::fs::write(&plugin_file, r#"{"name":"demo","version":"1.0.0"}"#).unwrap();
+
+        let id = "019ffd83-2e0c-7a33-bb3e-b840519f15f9";
+        let rollout = root.join(format!(
+            "sessions/2026/01/rollout-2026-01-01T00-00-00-{id}.jsonl"
+        ));
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(
+            &rollout,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{id}","model_provider":"custom"}}}}"#
+            ),
+        )
+        .unwrap();
+        make_state_db(&root, id, &rollout, false);
+        make_catalog_db(&root, &[(id, "甲", "custom", rollout.to_str().unwrap(), 1)]);
+
+        let sha = |p: &Path| {
+            crate::codex_overlay::fingerprint(p)
+                .ok()
+                .and_then(|f| f.sha256)
+                .unwrap_or_default()
+        };
+        let protected = ["config.toml", "providers.json", "auth.json"];
+        let before: Vec<String> = protected.iter().map(|f| sha(&root.join(f))).collect();
+        let plugin_before = sha(&plugin_file);
+
+        let backup_id =
+            create_history_backup(&root, &backup_dir, "repair", &[], Some("openai"), true).unwrap();
+        let fixed = sync_provider(&root, &backup_dir, "openai", "invariant-test-job", 0).unwrap();
+        assert!(fixed >= 1, "至少修复一条会话, 实际 {fixed}");
+        let _ = backup_id;
+
+        let after: Vec<String> = protected.iter().map(|f| sha(&root.join(f))).collect();
+        assert_eq!(before, after, "config/providers/auth 哈希必须零改动");
+        assert_eq!(plugin_before, sha(&plugin_file), "插件文件必须零改动");
+        let cfg = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(cfg.contains("[mcp_servers.fs]"), "MCP 配置段必须保留");
+        let body = std::fs::read_to_string(&rollout).unwrap();
+        assert!(
+            body.contains("\"openai\""),
+            "rollout provider 应已同步为 openai"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

@@ -152,14 +152,46 @@ pub fn save_store(codex_home: &Path, store: &Store) -> std::io::Result<()> {
     let data = serde_json::to_vec_pretty(store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = store_path(codex_home);
-    let tmp = codex_home.join(format!("{FILE_NAME}.tmp"));
+    // 可能同时发生凭证刷新与网关请求，使用唯一临时文件避免覆盖其他写入。
+    let tmp = codex_home.join(format!(
+        ".{FILE_NAME}.2xapi-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&tmp, data)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, &path)?;
+    #[cfg(windows)]
+    if path.exists() {
+        let old = codex_home.join(format!(
+            ".{FILE_NAME}.2xapi-{}.old",
+            uuid::Uuid::new_v4().simple()
+        ));
+        if let Err(error) = std::fs::rename(&path, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::rename(&old, &path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !path.exists() {
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -400,6 +432,7 @@ mod tests {
     }
 
     // ③ 原子写后 load 一致 + 权限 0600 + 无 .tmp 残留
+    #[cfg(unix)]
     #[test]
     fn save_store_atomic_and_permission_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -423,6 +456,18 @@ mod tests {
         assert_eq!(load_store(&empty_home), Store::empty());
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&empty_home);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_store_atomic_and_roundtrip_windows() {
+        let home = sandbox("atomic-windows");
+        let mut s = Store::empty();
+        s.set_for_key("sk-x", cred("u-x", 1));
+        save_store(&home, &s).unwrap();
+        assert!(!home.join(format!("{FILE_NAME}.tmp")).exists());
+        assert_eq!(load_store(&home), s);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ④ issue_node_cred 三分支(mock 本地 tiny HTTP server)+ 不可达

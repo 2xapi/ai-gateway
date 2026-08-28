@@ -1,6 +1,6 @@
 "use strict";
 /* ── 2xapi Codex Console · 界面重构 v2(视觉 = 无滚动条布局演示,逐块对齐;数据 = api-client 接真) ──
- * 词汇规范:统一「供应商」;主动词「开启托管 / 还原官方」;「会话」仅作名词;加速 seg「关 / 开·自动择优」。
+ * 词汇规范:统一「供应商」;Codex 主通道主动词「开启托管 / 停用 2xapi / 恢复官方配置」;「会话」仅作名词;加速 seg「关 / 开·自动择优」。
  * 交互规范:禁内联 onclick(CSP),一律 data-a 事件委托;通路图形状自检 节点数=连线数+1。
  */
 
@@ -8,9 +8,10 @@ var state = {
   agent: "codex",      // codex | claude
   view: "dash",        // dash | usage | history | settings
   selId: null,         // 当前选中供应商
-  providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
+  providers: [],       // GET /api/providers(过滤掉仅用于官方直连的 official;Mixed/PureApi 均保留)
   activeProviderIds: {}, // GET /api/providers.active_provider_ids(按平台隔离)
   dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}(Codex 托管)
+  codexRecovery: null, // Codex reset 预览与阶段状态
   claude: null,        // Claude 托管态:后端返回 {hosting:null|{providerId,providerName,model,way,...}}
   claudeStateError: null,
   claudeWayChoice: "gateway",
@@ -75,6 +76,10 @@ var state = {
   importProgress: "",
   importError: "",
   providersRequestSeq: 0,
+  profiles: [],
+  activeProfileId: "",
+  profilePreview: null,
+  profileBusy: false,
   sessionRequestSeq: 0,
   edit: null,          // 编辑草稿 {id,isNew,name,baseUrl,apiKey,model,wireApi,models}
   fieldErrors: {},
@@ -123,10 +128,8 @@ function hermesHosted() { var h = state.hermes; return !!(h && h.hosting); }
 function hermesPointerName() { var h = state.hermes; return (h && h.pointer) || ""; }
 function claudeWay() { var h = claudeHosting(); return (h && h.way) || state.claudeWayChoice || "gateway"; }
 function codexWayNow() {
-  var w = state.codexWay || "gateway";
-  /* 直连仅在 hasOfficial === false(纯 API 模式)可用;官方登录在/状态未知 → 回落网关 */
-  if (w === "direct" && !(state.dstate && state.dstate.hasOfficial === false)) return "gateway";
-  return w;
+  /* 桌面版直连已永久退役：不论旧 localStorage 或登录状态如何，始终使用零 Key 网关。 */
+  return "gateway";
 }
 function hostedBy(id) {
   if (state.agent === "claude") { var h = claudeHosting(); return !!(h && h.providerId === id); }
@@ -239,6 +242,15 @@ async function refreshDesktop() {
   var h = state.dstate && state.dstate.hosting;
   if (h && (h.way === "direct" || h.way === "gateway")) state.codexWay = h.way;
 }
+async function refreshProfiles() {
+  try {
+    var data = await api.profiles("codex");
+    state.profiles = (data && data.profiles) || [];
+    state.activeProfileId = (data && (data.activeProfileId || (data.activeProfiles || {}).codex)) || "";
+  } catch (e) {
+    state.profiles = state.profiles || [];
+  }
+}
 async function refreshClaudeState() {
   try {
     state.claude = await api.claudeState();
@@ -285,7 +297,7 @@ async function refreshBalance(sessionRequestSeq) {
   } catch (e) { /* 保留 session 快照余额 */ }
 }
 async function refreshAll() {
-  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState()]);
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshProfiles(), refreshSession(), refreshAccel(), refreshClaudeState()]);
 }
 
 /* ── 渲染 ── */
@@ -457,6 +469,97 @@ function assertRouteShape() {
   if (st && st !== lk + 1) console.warn("通路图形状异常: 节点 " + st + " ≠ 连线 " + lk + " + 1");
 }
 
+function currentProfileDraft(name) {
+  var p = lineOf(state.selId) || {};
+  return {
+    name: name,
+    agent: "codex",
+    providerId: p.id || "",
+    model: p.model || "",
+    wireApi: p.wireApi || "responses",
+    proxyUrl: p.proxyUrl || "",
+    accelMode: (state.accel && state.accel.mode) || "off",
+  };
+}
+
+function profileCardHtml() {
+  var profiles = state.profiles || [];
+  var selected = profiles.find(function (p) { return p.id === state.activeProfileId; }) || profiles[0] || null;
+  var options = profiles.map(function (p) {
+    return '<option value="' + esc(p.id) + '"' + (selected && p.id === selected.id ? ' selected' : '') + '>' + esc(p.name) + ' · ' + esc(p.providerId) + '</option>';
+  }).join("");
+  var status = selected ? ('当前档案：' + selected.name + ' · ' + selected.providerId) : '还没有配置档案；档案只保存路由元数据，不保存 API key 或 auth.json。';
+  var busy = state.profileBusy;
+  return '<section class="card profile-card"><div class="eyebrow" style="margin:0 0 3px">配置档案 · Codex</div>'
+    + '<div class="sub">把供应商、模型、协议和独立代理保存成可回滚的命名档案；官方登录与 auth.json 永远不在档案内。</div>'
+    + (profiles.length ? '<div class="grid2" style="margin-top:9px"><div class="f"><label>选择档案</label><select data-a="profile-select">' + options + '</select></div><div class="f"><label>状态</label><div class="sub" style="padding:8px 0">' + esc(status) + '</div></div></div>' : '<div class="sub" style="margin-top:9px">' + esc(status) + '</div>')
+    + '<div class="btn-row" style="margin-top:9px">'
+    + '<button class="btn primary" data-a="profile-create"' + (busy ? ' disabled' : '') + '>＋ 保存当前为档案</button>'
+    + (selected ? '<button class="btn" data-a="profile-apply"' + (busy ? ' disabled' : '') + '>应用档案</button><button class="btn ghost" data-a="profile-update"' + (busy ? ' disabled' : '') + '>用当前供应商覆盖</button><button class="btn ghost danger" data-a="profile-delete"' + (busy ? ' disabled' : '') + '>删除</button>' : '')
+    + '</div>'
+    + (state.profilePreview ? '<div class="sub" style="margin-top:8px;color:var(--c-official)">已生成预览：将更新 activeProviderId，创建配置/状态备份；auth.json、会话、MCP、插件和权限保持不变。</div>' : '')
+    + '</section>';
+}
+
+async function doProfileCreate() {
+  var provider = lineOf(state.selId);
+  if (!provider) { showToast("请先选择供应商", "error"); return; }
+  var name = window.prompt("档案名称（1–40 个字符）", provider.name || "我的 Codex 档案");
+  if (!name) return;
+  state.profileBusy = true; render();
+  try {
+    await api.createProfile(currentProfileDraft(name.trim()));
+    await refreshProfiles();
+    showToast("配置档案已保存", "ok");
+  } catch (e) { showToast("保存档案失败：" + (e.message || "未知错误"), "error"); }
+  state.profileBusy = false; render();
+}
+
+async function doProfileUpdate() {
+  var selected = (state.profiles || []).find(function (p) { return p.id === state.activeProfileId; }) || state.profiles[0];
+  var provider = lineOf(state.selId);
+  if (!selected || !provider) return;
+  var yes = await askConfirm("覆盖配置档案？", "将用当前供应商的路由、模型、协议和独立代理覆盖“" + selected.name + "”；不会写入 API key 或 auth.json。");
+  if (!yes) return;
+  state.profileBusy = true; render();
+  try {
+    await api.updateProfile(selected.id, currentProfileDraft(selected.name));
+    await refreshProfiles();
+    showToast("配置档案已更新", "ok");
+  } catch (e) { showToast("更新档案失败：" + (e.message || "未知错误"), "error"); }
+  state.profileBusy = false; render();
+}
+
+async function doProfileApply() {
+  var selected = (state.profiles || []).find(function (p) { return p.id === state.activeProfileId; }) || state.profiles[0];
+  if (!selected) return;
+  state.profileBusy = true; render();
+  try {
+    var preview = await api.previewProfile({ id: selected.id });
+    state.profilePreview = preview;
+    render();
+    var yes = await askConfirm("应用配置档案？", "将切换到“" + selected.name + "”，先备份受控配置并校验文件未被外部修改；官方 auth.json、历史会话、MCP、插件和权限不会被触碰。");
+    if (!yes) { state.profilePreview = null; state.profileBusy = false; render(); return; }
+    await api.applyProfile({ id: selected.id, previewToken: preview.previewToken, confirmed: true });
+    state.activeProfileId = selected.id;
+    state.profilePreview = null;
+    await refreshAll();
+    showToast("配置档案已应用", "ok");
+  } catch (e) { state.profilePreview = null; showToast("应用档案失败：" + (e.message || "未知错误"), "error"); }
+  state.profileBusy = false; render();
+}
+
+async function doProfileDelete() {
+  var selected = (state.profiles || []).find(function (p) { return p.id === state.activeProfileId; }) || state.profiles[0];
+  if (!selected) return;
+  var yes = await askConfirm("删除配置档案？", "只删除“" + selected.name + "”这条路由档案，不会删除供应商、官方登录或历史会话。");
+  if (!yes) return;
+  state.profileBusy = true; render();
+  try { await api.deleteProfile(selected.id); await refreshProfiles(); showToast("配置档案已删除", "ok"); }
+  catch (e) { showToast("删除档案失败：" + (e.message || "未知错误"), "error"); }
+  state.profileBusy = false; render();
+}
+
 /* ── 主卡 dash(Codex)── */
 function dashHtml() {
   var mine = providersFor("codex");
@@ -467,7 +570,9 @@ function dashHtml() {
       + '<div class="sub" style="max-width:380px">还没有供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站。</div>'
       + '<div class="btn-row" style="justify-content:center">'
       + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
-      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>' + ecoStripHtml("codex");
+      + '<button class="btn" data-a="new">＋ 新建供应商</button>'
+      + '<button class="btn ghost" data-a="codex-login">打开官方登录</button>'
+      + '<button class="btn danger" data-a="codex-reset-config">恢复 Codex 官方配置（保留登录）</button></div></section>' + ecoStripHtml("codex");
   }
   var h = hosting();
   var hp = h ? lineOf(h.providerId) : null;
@@ -475,8 +580,12 @@ function dashHtml() {
   var accelMode = acc.mode || "off";
   var accelOn = accelMode !== "off";
   var hasOff = !!(state.dstate && state.dstate.hasOfficial);
-  /* 直连门控:hasOfficial === false(纯 API 模式)才放开;官方登录在/状态未知 → 禁用 */
-  var directOk = !!(state.dstate && state.dstate.hasOfficial === false);
+  var login = state.dstate && state.dstate.login ? state.dstate.login : null;
+  var loginState = login && login.state ? login.state : "unknown";
+  var loginLabel = loginState === "signed_in" ? "已登录" : loginState === "signed_out" ? "未登录" : "状态未知";
+  var loginMethod = login && login.method && login.method !== "unknown" ? " · " + login.method : "";
+  /* 桌面版 direct 已退役：任何上游 Key 都不得落入 Codex 配置。 */
+  var directOk = false;
   var way = codexWayNow();
   var direct = way === "direct";
 
@@ -517,6 +626,7 @@ function dashHtml() {
   /* 详情卡在前、主卡在后(两世界一致) */
   var html = "";
   if (p) html += providerDetailCard(p);
+  html += profileCardHtml();
   html += '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
     + '<div class="detect">'
     + (hasOff
@@ -526,12 +636,16 @@ function dashHtml() {
     + '</div>'
     + '<div class="route">' + r + '</div>'
     + '<div class="route-mode"><span class="k">●</span> ' + note + '</div>'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding:9px 10px;background:var(--raised);border:1px solid var(--hair);border-radius:8px">'
+    + '<div style="min-width:0"><div style="font-size:12px;font-weight:600">官方 Codex 登录 <span class="tag" style="margin-left:4px">' + esc(loginLabel + loginMethod) + '</span></div>'
+    + '<div class="sub" style="margin-top:3px">状态来自官方 <span class="mono">codex login status</span>；2xapi 不读取或写入 <span class="mono">auth.json</span> / keyring。</div></div>'
+    + '<button class="btn sm ghost" data-a="codex-login">' + (loginState === "signed_in" ? "重新打开官方登录" : "打开官方登录") + '</button></div>'
     + scopeHtml
     + '<div class="grid2">'
     + '<div class="f"><label>通路方式</label><div class="seg">'
     + (directOk
       ? '<button data-a="way" data-w="direct" aria-pressed="' + direct + '" style="--lc:var(--c-direct)">直连<small>Key 写入本地配置</small></button>'
-      : '<button disabled style="--lc:var(--c-direct)">直连<small>' + (hasOff ? "官方登录下直连暂不支持(待实测)" : "即将支持") + '</small></button>')
+      : '<button disabled style="--lc:var(--c-direct)">直连<small>桌面版已退役(零 Key 安全边界)</small></button>')
     + '<button data-a="way" data-w="gateway" aria-pressed="' + (!direct) + '" style="--lc:var(--c-gw)">网关 + 加速<small>零 Key(默认)</small></button></div></div>'
     + '<div class="f"><label>加速</label><div style="display:flex;gap:6px;align-items:center">'
     + '<div class="seg" style="flex:1">'
@@ -542,8 +656,9 @@ function dashHtml() {
     + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:' + wayTagColor + ';color:' + wayTagColor + '">' + (hp ? (direct ? "直连 · Key 写入本地配置" : "网关 · 配置零 Key") : "未托管") + '</span></div></div>'
     + '</div>'
     + '<div class="btn-row">'
-    + (hp ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
+    + (hp ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>停用 2xapi</button>'
       : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
+    + '<button class="btn danger" data-a="codex-reset-config"' + (state.busy === "codex-reset" ? " disabled" : "") + '>恢复 Codex 官方配置（保留登录）</button>'
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
@@ -566,7 +681,7 @@ function providerDetailCard(p) {
   } else {
     /* Codex 世界:启用(未托管)/停用(已托管)+ 编辑 + 诊断 + 删除(托管中禁用)——与 Claude 分支同构 */
     btns = (hb
-      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>停用</button>'
+      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>停用 2xapi</button>'
       : '<button class="btn primary" data-a="host-on" data-id="' + esc(p.id) + '"' + (state.busy === "host" ? " disabled" : "") + '>启用</button>')
       + '<button class="btn" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
@@ -578,6 +693,8 @@ function providerDetailCard(p) {
     + '<div><div class="k">api key</div><div class="v mono">' + esc(p.apiKeyMasked || "—") + '</div></div>'
     + '<div><div class="k">协议</div><div class="v mono">' + esc(wireLabel(p)) + '</div></div>'
     + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
+    + '<div><div class="k">接入模式</div><div class="v">' + esc(p.accessMode === "mixed" ? "保持官方登录 · Mixed" : "纯第三方 API · Pure API") + '</div></div>'
+    + '<div><div class="k">供应商独立代理</div><div class="v mono">' + esc(p.proxyUrl || "不使用") + '</div></div>'
     + '</div>'
     + '<div class="btn-row">' + btns + '</div></section>';
   if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
@@ -731,12 +848,23 @@ function diagCard(d) {
     return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
       + '<div class="step">⟳ 诊断进行中…<span class="meta">连接测试 + 真实请求</span></div></div></section>';
   }
-  var errs = (d.errors || []).map(function (e) { return esc(e.message || e.msg || String(e)); }).join(";");
-  return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
-    + '<div class="step' + cls(d.configValid) + '">' + ok(d.configValid) + ' 配置校验<span class="meta">' + (d.configValid ? "pass" : "fail") + '</span></div>'
-    + '<div class="step' + cls(d.reachable) + '">' + ok(d.reachable) + ' 连接测试<span class="meta">' + (d.reachable ? ((d.latencyMs != null ? d.latencyMs + "ms · " : "") + (d.models || []).length + " models") : "不通") + '</span></div>'
-    + '<div class="step' + cls(d.testOk) + '">' + ok(d.testOk) + ' 真实请求<span class="meta">' + (d.testOk ? "pass" : "fail") + '</span></div>'
-    + '</div>' + (errs ? '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">' + errs + '</div>' : "")
+  var errs = (d.errors || []).map(function (e) { return esc((e.category && e.category !== "none" ? "[" + e.category + "] " : "") + (e.message || e.msg || String(e))); }).join(";");
+  var checks = (d.checks && d.checks.length) ? d.checks : [
+    { id: "config", stage: "config", status: d.configValid ? "passed" : "failed", message: d.configValid ? "配置校验通过" : "配置校验失败" },
+    { id: "models", stage: "models", status: d.reachable ? "passed" : "failed", message: d.reachable ? "模型目录可访问" : "连接失败" },
+    { id: "request", stage: "request", status: d.testOk ? "passed" : "failed", message: d.testOk ? "最小请求通过" : "真实请求失败" }
+  ];
+  var rows = checks.map(function (c) {
+    var passed = c.status === "passed", skipped = c.status === "skipped";
+    return '<div class="step' + (!passed && !skipped ? ' bad' : '') + '">' + (passed ? '✓' : skipped ? '—' : '✗') + ' ' + esc(c.stage || c.id) + '<span class="meta">' + esc(c.message || c.status) + (!passed && !skipped && c.errorClass && c.errorClass !== "none" ? ' · ' + esc(c.errorClass) : '') + (!passed && !skipped && c.httpStatus ? ' · HTTP ' + c.httpStatus : '') + (c.latencyMs != null ? ' · ' + c.latencyMs + 'ms' : '') + '</span></div>';
+  }).join("");
+  var health = d.health || {};
+  var healthText = health.status ? ('健康：' + health.status + ' · 熔断：' + (health.circuit || "closed") + (health.consecutiveFailures ? ' · 连续失败 ' + health.consecutiveFailures : '')) : '';
+  var suggestions = (d.suggestions || []).map(function (s) { return '<div class="sub">• ' + esc(s) + '</div>'; }).join("");
+  return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / Doctor 2.0</div><div class="steps" style="margin-top:0">' + rows + '</div>'
+    + (healthText ? '<div class="sub" style="margin-top:8px">' + esc(healthText) + '</div>' : '')
+    + (errs ? '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">' + errs + '</div>' : '')
+    + (suggestions ? '<div style="margin-top:8px">' + suggestions + '</div>' : '')
     + '</section>';
 }
 
@@ -1908,16 +2036,25 @@ function codexSessionManagerHtml() {
       + '<button class="btn sm danger" data-a="sess-delete-one" data-id="' + esc(item.id) + '"' + (!item.deletable ? ' disabled' : '') + '>删除</button></div></div>';
   }).join("");
   var auto = !!state.sessionsAutoDraft;
-  var progressClass = job.status === "failed" ? " error" : job.status === "completed" ? " done" : "";
+  var progressClass = (job.status === "failed") ? " error" : (job.status === "completed" || job.status === "cancelled") ? " done" : "";
+  var jobActions = "";
+  if (["running", "queued"].indexOf(job.status) >= 0) {
+    jobActions = '<button class="btn sm ghost danger" data-a="sess-job-cancel">取消任务</button>';
+  } else if (job.status === "cancelling") {
+    jobActions = '<button class="btn sm ghost" disabled>正在取消…</button>';
+  } else if (job.status === "failed" || job.status === "cancelled") {
+    jobActions = job.id ? '<button class="btn sm ghost" data-a="sess-job-resume">恢复任务</button>' : '';
+  }
   var undo = state.sessionsLastDelete && state.sessionsLastDelete.backupId
     ? '<button class="btn ghost" data-a="sess-undo" data-id="' + esc(state.sessionsLastDelete.backupId) + '">撤销上次删除</button>' : '';
   return '<div class="session-page">'
     + '<section class="session-heading"><div><h1>会话管理</h1><div class="sub">查看、删除和修复 Codex 本地会话</div></div><button class="btn ghost" data-a="sess-restart">重新打开 Codex</button></section>'
     + '<section class="session-stats"><div><span>当前页会话</span><b>' + (stats.sessions || 0) + ' 个</b></div><div><span>当前页未归档</span><b>' + (stats.active || 0) + ' 个</b></div><div><span>当前页已归档</span><b>' + (stats.archived || 0) + ' 个</b></div><div class="wide"><span>数据库</span><b class="mono">' + esc((state.sessionsDbPaths && (state.sessionsDbPaths.catalog || state.sessionsDbPaths.state)) || "未找到") + '</b></div></section>'
     + '<section class="card session-control"><div class="f"><label>同步目标</label><select data-a="sess-target">' + targetOptions + '</select><div class="sub">来源标签表示该 Provider 出现在配置、会话、索引、手动目录或当前配置中。</div></div><div class="btn-row"><button class="btn ghost" data-a="sess-refresh"' + (state.sessionsLoading ? ' disabled' : '') + '>刷新会话</button><button class="btn primary" data-a="sess-repair"' + (state.sessionsRepairing || !state.sessionsTarget ? ' disabled' : '') + '>立刻修复历史会话</button></div></section>'
-    + '<section class="card session-progress"><div class="session-progress-head"><b>历史会话修复进度</b><strong>' + (job.percent || 0) + '%</strong></div><div class="session-progress-track"><span class="session-progress-bar' + progressClass + '" style="width:' + Math.max(0, Math.min(100, job.percent || 0)) + '%"></span></div><div class="sub ' + (job.status === "failed" ? 'session-error' : '') + '">' + esc(job.error || job.message || "尚未运行历史会话修复。") + (job.backupId ? ' · 备份 ' + esc(job.backupId) : '') + '</div></section>'
+    + '<section class="card session-progress"><div class="session-progress-head"><b>历史会话修复进度</b><strong>' + (job.percent || 0) + '%</strong></div><div class="session-progress-track"><span class="session-progress-bar' + progressClass + '" style="width:' + Math.max(0, Math.min(100, job.percent || 0)) + '%"></span></div><div class="sub ' + ((job.status === "failed" || job.status === "cancelled") ? 'session-error' : '') + '">' + esc(job.error || job.message || "尚未运行历史会话修复。") + (job.total ? ' · 成功 ' + (job.fixed || 0) + ' / 跳过 ' + (job.skipped || 0) + ' / 失败 ' + (job.failed || 0) + '（' + (job.processed || 0) + '/' + job.total + '）' : '') + ((job.status === "failed" || job.status === "cancelled") && job.checkpoint ? ' · 断点 ' + job.checkpoint : '') + (job.stalled ? ' · 任务可能停滞，请稍后取消或恢复' : '') + (job.backupId ? ' · 备份 ' + esc(job.backupId) : '') + (job.heartbeatAt ? ' · 心跳 ' + esc(fmtTime(job.heartbeatAt * 1000)) : '') + '</div><div class="btn-row" style="margin-top:8px">' + jobActions + '</div></section>'
     + '<section class="session-warning">删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。</section>'
     + '<section class="card session-autofix"><label><input type="checkbox" data-a="sess-autofix"' + (auto ? ' checked' : '') + '> 启动前自动修复历史会话</label><div class="sub">开启后，在继续会话或重新打开 Codex 前自动整理一次历史索引。</div><button class="btn ghost" data-a="sess-save-settings"' + (state.sessionsSettingsSaving ? ' disabled' : '') + '>' + (state.sessionsSettingsSaving ? '保存中…' : '保存自动修复设置') + '</button></section>'
+    + '<section class="card" style="border-color:rgba(226,88,78,.4)"><h2 style="font-size:14px;color:var(--c-err)">Codex 环境恢复（高级）</h2><div class="sub">仅在 Codex 登录或配置损坏、无法正常启动时使用；这不是历史会话修复。初始化会先调用官方 <span class="mono">codex logout</span>，完成后需要你重新登录，历史会话、MCP、插件和权限数据默认保留。</div><div class="btn-row" style="margin-top:8px"><button class="btn danger" data-a="codex-reset-all"' + (state.busy === "codex-reset" ? ' disabled' : '') + '>初始化 Codex（退出登录并重新登录）</button></div></section>'
     + '<section class="card session-list"><div class="session-list-head"><div><b>本地会话</b><div class="sub">第 ' + state.sessionsPage + ' 页，每页最多 ' + state.sessionsPageSize + ' 条，按更新时间倒序显示</div></div><div class="session-select-count">已选择 ' + selectedCount + ' / ' + items.length + ' 个会话</div></div>'
     + '<div class="session-toolbar"><button class="btn sm ghost" data-a="sess-select-all">全选当前列表</button><button class="btn sm ghost" data-a="sess-clear-selection">清空选择</button><button class="btn sm ghost" data-a="sess-selection-mode">' + (state.sessionsSelectionMode ? '退出多选' : '多选') + '</button><button class="btn sm danger" data-a="sess-delete-selected"' + (selectedCount ? '' : ' disabled') + '>删除所选</button>' + undo + '</div>'
     + '<div class="session-rows">' + rows + '</div><div class="session-pager"><button class="btn ghost" data-a="sess-prev"' + (state.sessionsPage <= 1 || state.sessionsLoading ? ' disabled' : '') + '>上一页</button><span>第 ' + state.sessionsPage + ' 页</span><button class="btn ghost" data-a="sess-next"' + (!state.sessionsHasMore || state.sessionsLoading ? ' disabled' : '') + '>下一页</button></div></section></div>';
@@ -2040,20 +2177,23 @@ async function pollSessionsJob(id) {
   try {
     var job = await api.sessionsJob(id);
     if (state.view !== "history") return; /* 轮询期间切走 → 不再重绘/续排 */
+    var activeJob = ["queued", "running", "cancelling"].indexOf(job.status) >= 0;
+    if (activeJob && job.heartbeatAt && (Date.now() / 1000 - Number(job.heartbeatAt)) > 30) job.stalled = true;
     state.sessionsRepairJob = job;
-    state.sessionsRepairing = job.status === "running";
+    state.sessionsRepairing = ["queued", "running", "cancelling"].indexOf(job.status) >= 0;
     render();
-    if (job.status === "running") {
+    if (["queued", "running", "cancelling"].indexOf(job.status) >= 0) {
       state.sessionsRepairTimer = setTimeout(function () { pollSessionsJob(id); }, 1000);
     } else {
       if (job.status === "completed") showToast(job.message || "历史会话修复完成", "ok");
-      else showToast(job.error || "历史会话修复失败", "error");
+      else if (job.status === "cancelled") showToast(job.message || "历史会话修复已取消，可恢复", "ok");
+      else showToast(job.error || "历史会话修复失败，可恢复", "error");
       await loadCodexHistory(1);
     }
   } catch (e) {
     if (state.view !== "history") return;
     state.sessionsRepairing = false;
-    state.sessionsRepairJob = { status: "failed", percent: 0, error: e.message || "读取修复进度失败" };
+    state.sessionsRepairJob = { id: id, status: "failed", percent: 0, error: e.message || "读取修复进度失败" };
     render();
   }
 }
@@ -2061,7 +2201,14 @@ async function pollSessionsJob(id) {
 async function doSessionsRepair() {
   if (!state.sessionsTarget || state.sessionsRepairing) return;
   var inspect = state.sessionsInspect || {};
-  var detail = "将历史会话的 Provider 归属同步到 " + state.sessionsTarget + "，并先创建完整本地备份。";
+  var preview;
+  try {
+    preview = await api.sessionsRepairPreview(state.sessionsTarget);
+  } catch (e) {
+    showToast("修复预览失败：" + (e.message || "未知错误"), "error");
+    return;
+  }
+  var detail = "将历史会话的 Provider 归属同步到 " + state.sessionsTarget + "，预计处理 " + (preview.total || 0) + " 个会话，并先创建完整本地备份。";
   if (inspect.codexRunning) detail += " Codex 当前正在运行，请先退出 Codex 后再执行。";
   var confirmed = await askConfirm("修复历史会话？", detail);
   if (!confirmed) return;
@@ -2069,7 +2216,7 @@ async function doSessionsRepair() {
   state.sessionsRepairJob = { status: "running", percent: 0, message: "正在创建修复任务…" };
   render();
   try {
-    var result = await api.sessionsRepair(state.sessionsTarget);
+    var result = await api.sessionsRepair(state.sessionsTarget, preview.previewToken);
     await pollSessionsJob(result.jobId);
   } catch (e) {
     state.sessionsRepairing = false;
@@ -2077,6 +2224,28 @@ async function doSessionsRepair() {
     showToast("修复失败：" + (e.message || "未知错误"), "error");
     render();
   }
+}
+
+async function cancelSessionsRepair() {
+  var job = state.sessionsRepairJob;
+  if (!job || !job.id || !state.sessionsRepairing) return;
+  try {
+    await api.sessionsJobCancel(job.id);
+    showToast("已请求取消，正在等待当前步骤安全退出", "ok");
+    await pollSessionsJob(job.id);
+  } catch (e) { showToast("取消修复失败：" + (e.message || "未知错误"), "error"); }
+}
+
+async function resumeSessionsRepair() {
+  var job = state.sessionsRepairJob;
+  if (!job || !job.id || state.sessionsRepairing) return;
+  try {
+    var result = await api.sessionsJobResume(job.id);
+    state.sessionsRepairing = true;
+    state.sessionsRepairJob = { id: result.jobId, status: "queued", percent: 0, message: "正在恢复修复任务…" };
+    render();
+    await pollSessionsJob(result.jobId);
+  } catch (e) { showToast("恢复修复失败：" + (e.message || "未知错误"), "error"); }
 }
 
 async function saveSessionsSettings() {
@@ -2245,10 +2414,11 @@ function openEdit(id) {
   var isC = state.agent === "claude";
   var isCd = state.agent === "claude-desktop";
   var isH = state.agent === "hermes";
+  var isCodex = state.agent === "codex";
   var defWire = (isC || isCd) ? "anthropic" : (isH ? "chat_completions" : "responses");
   state.edit = p
-    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, ua: p.userAgent || null, models: (p.models || []).map(normModel), claudeDesktopModelRoutes: normClaudeDesktopRoutes(p.claudeDesktopModelRoutes || p.claude_desktop_model_routes, p.model || "") }
-    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, ua: null, models: [], claudeDesktopModelRoutes: normClaudeDesktopRoutes([], "") };
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", accessMode: p.accessMode || (isCodex ? "mixed" : "pure_api"), model: p.model || "", wireApi: p.wireApi || defWire, proxyUrl: p.proxyUrl || "", originalProxyUrl: p.proxyUrl || "", timeoutSecs: p.timeoutSecs || null, icon: p.icon || null, iconColor: p.iconColor || null, ua: p.userAgent || null, models: (p.models || []).map(normModel), claudeDesktopModelRoutes: normClaudeDesktopRoutes(p.claudeDesktopModelRoutes || p.claude_desktop_model_routes, p.model || "") }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", accessMode: isCodex ? "mixed" : "pure_api", model: "", wireApi: defWire, proxyUrl: "", timeoutSecs: null, icon: null, iconColor: null, ua: null, models: [], claudeDesktopModelRoutes: normClaudeDesktopRoutes([], "") };
   state.fieldErrors = {};
   document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + agentName(state.agent);
   var editBox = document.getElementById("editBox");
@@ -2258,6 +2428,14 @@ function openEdit(id) {
   document.getElementById("eKey").value = "";
   document.getElementById("eKey").placeholder = state.edit.isNew ? (isC ? "sk-ant-..." : "sk-...") : (p.apiKeyMasked ? "•••• 未改则留空" : (isC ? "sk-ant-..." : "sk-..."));
   document.getElementById("eModel").value = state.edit.model;
+  var modeWrap = document.getElementById("eModeWrap");
+  var modeSel = document.getElementById("eMode");
+  if (modeWrap) modeWrap.style.display = isCodex ? "" : "none";
+  if (modeSel) { modeSel.value = isCodex ? state.edit.accessMode : "pure_api"; modeSel.disabled = !isCodex; }
+  var proxyEl = document.getElementById("eProxy");
+  var timeoutEl = document.getElementById("eTimeout");
+  if (proxyEl) proxyEl.value = state.edit.proxyUrl || "";
+  if (timeoutEl) timeoutEl.value = state.edit.timeoutSecs || "";
   var wSel = document.getElementById("eWire");
   /* 新建一律显示「自动」(保存时落世界默认值,拉取模型探测后回写);编辑已有供应商显示当前实际协议 */
   if (wSel) {
@@ -2282,6 +2460,8 @@ function collectEdit() {
     baseUrl: $("#eUrl").value.trim(),
     apiKey: $("#eKey").value,
     model: $("#eModel").value.trim(),
+    proxyUrl: ($("#eProxy") || { value: "" }).value.trim(),
+    timeoutSecs: ($("#eTimeout") || { value: "" }).value.trim(),
   };
 }
 function readModelRows() {
@@ -2299,9 +2479,10 @@ function closeEdit() { document.getElementById("editMask").style.display = "none
 async function doSaveEdit() {
   var d = collectEdit();
   var errs = {};
+  var selectedMode = state.agent === "codex" ? ((document.getElementById("eMode") || { value: "mixed" }).value || "mixed") : "pure_api";
   if (!d.name) errs.name = "必填";
-  if (!d.baseUrl) errs.baseUrl = "必填";
-  if (state.edit.isNew && !d.apiKey) errs.apiKey = "新建必填";
+  if (!d.baseUrl && selectedMode !== "official") errs.baseUrl = "必填";
+  if (state.edit.isNew && selectedMode !== "official" && !d.apiKey) errs.apiKey = "新建必填";
   var models = readModelRows();
   var desktopRoutes = state.agent === "claude-desktop" ? readClaudeDesktopRoutes() : null;
   if (errs.name || errs.baseUrl || errs.apiKey) {
@@ -2314,19 +2495,27 @@ async function doSaveEdit() {
     : "";
   var model = d.model || mappedDefault || (models.length ? models[0].name : "");
   var body = {
-    name: d.name, accessMode: "pure_api", model: model,
+    name: d.name, accessMode: selectedMode, model: model,
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
     wireApi: (function () { var w = document.getElementById("eWire"); var v = w ? w.value : "auto"; return v === "auto" ? state.edit.wireApi : v; })(), models: models,
-    proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
+    timeoutSecs: d.timeoutSecs ? Number(d.timeoutSecs) : null,
     userAgent: (document.getElementById("eUa") || { value: "" }).value || null,
     icon: state.edit.icon || null,
     iconColor: state.edit.iconColor || null,
     agent: state.agent,
   };
+  // 公开供应商接口只返回脱敏后的代理地址。编辑已有供应商且用户未改代理时，
+  // 省略该字段，让后端保留磁盘中的真实值（尤其是 proxy URL 中的用户名/密码）。
+  if (state.edit.isNew || d.proxyUrl !== (state.edit.originalProxyUrl || "")) {
+    body.proxyUrl = d.proxyUrl || null;
+  }
   if (desktopRoutes) {
     body.wireApi = "anthropic";
     body.claudeDesktopModelRoutes = desktopRoutes;
   }
+  var activeCodexHosted = state.agent === "codex"
+    && !!hosting()
+    && hosting().providerId === state.edit.id;
   state.busy = "save"; render();
   try {
     var saved = state.edit.isNew ? await api.createProvider(body) : await api.updateProvider(state.edit.id, body);
@@ -2334,7 +2523,9 @@ async function doSaveEdit() {
     await refreshProviders();
     state.selId = (saved && (saved.id || (saved.provider && saved.provider.id))) || state.selId;
     closeEdit();
-    showToast("供应商已保存(仅存于本软件,未写任何配置)", "ok");
+    showToast(activeCodexHosted
+      ? "供应商已保存，当前 Codex 托管配置已同步"
+      : "供应商已保存(仅存于本软件,未写其他平台配置)", "ok");
   } catch (e) {
     state.fieldErrors = {};
     showToast(e.message, "error");
@@ -2811,7 +3002,7 @@ async function doImport() {
         var suffix = 2;
         while (usedNames.has(name)) name = baseName + " " + suffix++;
         await api.createProvider({
-          name: name, accessMode: "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
+          name: name, accessMode: state.agent === "codex" ? "mixed" : "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
           model: item.models[0].name, models: item.models,
           reasoning_levels: item.levels,
           agent: state.agent,
@@ -3414,15 +3605,19 @@ async function doAutostartToggle() {
   renderSettings();
 }
 function setAdvancedHtml() {
+  var codexLogin = state.dstate && state.dstate.login ? state.dstate.login : null;
+  var loginLabel = codexLogin
+    ? ((codexLogin.state === "signed_in" ? "已登录" : codexLogin.state === "signed_out" ? "未登录" : "状态未知") + " · " + (codexLogin.method || "unknown"))
+    : "正在探测…";
   return '<h3 style="margin:2px 0 4px;font-size:13.5px">高级</h3>'
     + setRow('Codex CLI 路径(自动检测)', '<button class="btn sm ghost" data-a="adv-recodex">重新检测</button>',
       '<span class="mono" style="font-size:10px">/Applications/ChatGPT.app/…/codex</span> · 环境变量 CODEX_CLI_PATH 可覆盖')
     + setRow('运行日志', '<button class="btn sm ghost" data-a="adv-inspect">查看</button>', '排障用;含网关请求摘要')
     + setRow('供应商变更审计', '<span class="tag">providers.audit.jsonl</span>', '每次增删改自动记录')
-    + '<div style="margin-top:14px;padding:10px 12px;border:1px solid rgba(226,88,78,.4);border-radius:8px">'
-    + '<div style="font-size:12.5px;color:var(--c-err);font-weight:600">应急 · 恢复官方配置</div>'
-    + '<div class="sub">清除本软件写入的全部托管痕迹(config/auth),~/.codex 回到官方初始状态;操作前自动备份,可从备份找回。</div>'
-    + '<button class="btn sm danger" data-a="restore-official" style="margin-top:6px">执行恢复</button></div>';
+    + setRow('官方 Codex 登录', '<span class="tag">' + esc(loginLabel) + '</span>', '只读状态；登录和恢复入口在 Codex 主通道，会话管理页仅提供高级初始化')
+    + '<div style="margin-top:14px;padding:10px 12px;border:1px solid var(--hair);border-radius:8px">'
+    + '<div style="font-size:12.5px;font-weight:600">Codex 恢复入口</div>'
+    + '<div class="sub" style="margin-top:4px">此处只保留诊断说明，不在高级设置中直接修改 Codex。请从 Codex 主通道执行“恢复 Codex 官方配置（保留登录）”，或从会话管理的“Codex 环境恢复（高级）”执行完整初始化。</div></div>';
 }
 function setAboutHtml() {
   /* 惰性拉取真实构建版本;失败显示未知,不伪造版本号。 */
@@ -3618,6 +3813,53 @@ async function doRestoreOfficial() {
   } finally {
     state.busy = null;
     render();
+  }
+}
+
+async function doCodexReset(mode) {
+  var full = mode === "reset-all";
+  var title = full ? "完整初始化官方 Codex?" : "重置官方配置并保留登录?";
+  try {
+    var preview = await api.codexRecoveryPreview(mode);
+    state.codexRecovery = preview;
+    render();
+    var warning = full
+      ? "将先调用官方 codex logout 清理 file/keyring 登录；随后由你重新执行 codex login。只隔离精确的 Codex 配置与残留 auth.json，历史会话默认保留。"
+      : "将把预览列出的 config.toml、2xapi provider/catalog 和 sidecar 移入可恢复隔离目录；auth.json、keyring 和历史会话保持不变。"
+      + "\n\n隔离目录：" + ((preview && preview.codexHome) || "CODEX_HOME/2xapi-reset");
+    var yes = await askConfirm(title, warning);
+    if (!yes) return;
+    state.busy = "codex-reset"; render();
+    var result = await api.codexRecoveryApply(mode, preview.previewToken, true);
+    state.codexRecovery = Object.assign({}, preview, result || {});
+    await refreshAll();
+    showToast(full ? "官方凭据已交给 codex logout 处理，请继续执行 codex login" : "已恢复官方默认路由，官方登录保持不变", "ok");
+  } catch (e) {
+    showToast((e && e.message) || "Codex reset 失败", "error");
+  } finally {
+    state.busy = null; render();
+  }
+}
+
+async function doCodexLogin() {
+  try {
+    var started = await api.codexLoginStart(false);
+    showToast("官方登录流程已启动，请在授权页完成登录", "ok");
+    var deadline = Date.now() + 120000;
+    var poll = async function () {
+      if (Date.now() > deadline) { showToast("登录状态等待超时，请点击状态刷新", "error"); return; }
+      try {
+        var status = await api.codexLoginStatus();
+        if (status && status.state === "signed_in") {
+          await refreshAll(); render(); showToast("Codex 官方登录已确认", "ok"); return;
+        }
+      } catch (e) { /* 轮询失败不把已启动误报为登录失败 */ }
+      setTimeout(poll, 2000);
+    };
+    setTimeout(poll, 1000);
+    return started;
+  } catch (e) {
+    showToast((e && e.message) || "官方登录启动失败", "error");
   }
 }
 
@@ -3976,6 +4218,9 @@ document.addEventListener("click", function (ev) {
       break;
     }
     case "restore-official": doRestoreOfficial(); break;
+    case "codex-reset-config": doCodexReset("reset-config"); break;
+    case "codex-reset-all": doCodexReset("reset-all"); break;
+    case "codex-login": doCodexLogin(); break;
     case "confirm-yes":
       document.getElementById("confirmMask").style.display = "none";
       if (state.confirmCb) { var cb = state.confirmCb; state.confirmCb = null; cb(true); }
@@ -4018,7 +4263,9 @@ document.addEventListener("click", function (ev) {
         });
         break;
       }
-      askConfirm("还原官方?", "清除本软件写入的托管配置(config 托管段 / auth Key),~/.codex 回到官方状态;操作前自动备份。").then(function (yes) {
+      askConfirm(state.agent === "codex" ? "停用 2xapi?" : "还原官方?", state.agent === "codex"
+        ? "移除本软件写入的独占 2xapi gateway overlay，保留官方登录、MCP、插件和其他用户配置；操作前自动备份。"
+        : "清除本软件写入的托管配置(config 托管段 / auth Key),~/.codex 回到官方状态;操作前自动备份。").then(function (yes) {
         if (yes) doUnhost();
       });
       break;
@@ -4056,9 +4303,15 @@ document.addEventListener("click", function (ev) {
       break;
     case "diag": doDiag(); break;
     case "test": doTestConnection(); break;
+    case "profile-create": doProfileCreate(); break;
+    case "profile-update": doProfileUpdate(); break;
+    case "profile-apply": doProfileApply(); break;
+    case "profile-delete": doProfileDelete(); break;
     case "sess-continue": doSessionResume(t.dataset.i); break;
     case "sess-refresh": loadCodexHistory(state.sessionsPage); break;
     case "sess-repair": doSessionsRepair(); break;
+    case "sess-job-cancel": cancelSessionsRepair(); break;
+    case "sess-job-resume": resumeSessionsRepair(); break;
     case "sess-restart": restartCodexFromSessions(); break;
     case "sess-save-settings": saveSessionsSettings(); break;
     case "sess-prev": if (state.sessionsPage > 1) loadSessions(state.sessionsPage - 1); break;
@@ -4116,6 +4369,12 @@ document.addEventListener("change", function (ev) {
   var target = ev.target.closest("[data-a='sess-target']");
   if (target) {
     state.sessionsTarget = target.value;
+    render();
+    return;
+  }
+  var profile = ev.target.closest("[data-a='profile-select']");
+  if (profile) {
+    state.activeProfileId = profile.value || "";
     render();
     return;
   }
@@ -4270,7 +4529,7 @@ var IS_USAGE_OVERLAY = new URLSearchParams(window.location.search).get("overlay"
 function initUsageOverlay() {
   document.documentElement.classList.add("usage-overlay-page");
   document.body.classList.add("usage-overlay-page");
-  document.body.innerHTML = '<main class="usage-overlay" id="usageOverlayRoot" data-tauri-drag-region="bare"><div class="usage-overlay-head" data-tauri-drag-region="bare" title="按住拖动窗口"><b>今日 Token</b><span class="usage-overlay-version" id="overlayVersion">v1.0.13</span><span class="usage-overlay-drag" data-tauri-drag-region="bare" aria-hidden="true"></span><button class="usage-overlay-close" data-a="overlay-hide" title="隐藏悬浮窗">×</button></div><div class="usage-overlay-value" id="overlayTotal">暂无数据</div><div class="usage-overlay-meta" id="overlayMeta">正在同步…</div><div class="usage-overlay-foot"><span id="overlayCache">缓存命中率 暂无数据</span><button data-a="overlay-refresh" title="刷新">↻</button></div></main>';
+  document.body.innerHTML = '<main class="usage-overlay" id="usageOverlayRoot"><div class="usage-overlay-head" data-tauri-drag-region="deep" title="按住拖动窗口"><b>今日 Token</b><span class="usage-overlay-version" id="overlayVersion">v1.0.13</span><span class="usage-overlay-drag" aria-hidden="true"></span><button class="usage-overlay-close" data-a="overlay-hide" title="隐藏悬浮窗">×</button></div><div class="usage-overlay-value" id="overlayTotal">暂无数据</div><div class="usage-overlay-meta" id="overlayMeta">正在同步…</div><div class="usage-overlay-foot"><span id="overlayCache">缓存命中率 暂无数据</span><button data-a="overlay-refresh" title="刷新">↻</button></div></main>';
   var root = document.getElementById("usageOverlayRoot");
   var refreshButton = root.querySelector("[data-a='overlay-refresh']");
   var timer = null;

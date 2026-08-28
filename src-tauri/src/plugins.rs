@@ -11,7 +11,7 @@ use crate::server::AppState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 pub const MOUNTS: &[&str] = &["media_parse", "tool_exec", "proto_convert", "dispatch"];
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -30,6 +30,76 @@ fn plugin_client() -> reqwest::Client {
         .no_proxy()
         .build()
         .unwrap_or_default()
+}
+
+fn blocked_plugin_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            !(address.is_loopback())
+                && (address.is_private()
+                    || address.is_link_local()
+                    || address.is_unspecified()
+                    || address.is_multicast()
+                    || address.octets() == [169, 254, 169, 254])
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return blocked_plugin_ip(IpAddr::V4(mapped));
+            }
+            !(address.is_loopback())
+                && (address.is_unique_local()
+                    || address.is_unicast_link_local()
+                    || address.is_unspecified()
+                    || address.is_multicast())
+        }
+    }
+}
+
+/// 插件/市场地址是服务端主动请求的目标。允许 loopback（本机插件），
+/// 拒绝 RFC1918、链路本地、IPv6 ULA 和云元数据地址，避免 manifest/invoke 形成 SSRF。
+async fn validate_plugin_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(endpoint.trim()).map_err(|e| format!("插件地址无效: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("插件地址仅支持 http(s)".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("插件地址不得包含用户名或密码".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "插件地址缺少主机名".to_string())?;
+    // `Url::host_str()` 保留 IPv6 方括号，先剥离后再做 IpAddr 解析，
+    // 否则 `[::ffff:10.0.0.8]` 等 IPv4-mapped 内网地址会绕过拦截。
+    let host_for_parse = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let lower = host_for_parse.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "metadata.google.internal" | "metadata" | "instance-data"
+    ) || lower == "169.254.169.254"
+    {
+        return Err("拒绝访问云元数据地址".into());
+    }
+    if let Ok(ip) = host_for_parse.parse::<IpAddr>() {
+        if blocked_plugin_ip(ip) {
+            return Err("拒绝访问内网/链路本地插件地址".into());
+        }
+    } else {
+        // DNS 解析后再次检查，降低 DNS rebinding 把公开域名解析到内网的风险。
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "插件地址缺少有效端口".to_string())?;
+        if let Ok(addresses) = tokio::net::lookup_host((host_for_parse, port)).await {
+            for address in addresses {
+                if blocked_plugin_ip(address.ip()) {
+                    return Err("插件域名解析到内网/链路本地地址，已拒绝".into());
+                }
+            }
+        }
+    }
+    Ok(url)
 }
 
 /// 校验 manifest(M3+M5 契约 v2):必填 id/name/version/mount/input/output;mount 须四挂载点之一。
@@ -171,7 +241,8 @@ fn resolved_config_values(
 
 /// 拉取并校验 manifest;Ok = manifest 全量(含 endpoint 回填)。
 pub async fn fetch_manifest(endpoint: &str) -> Result<Map<String, Value>, String> {
-    let base = endpoint.trim_end_matches('/');
+    let validated = validate_plugin_endpoint(endpoint).await?;
+    let base = validated.as_str().trim_end_matches('/').to_string();
     let resp = plugin_client()
         .get(format!("{base}/manifest"))
         .timeout(std::time::Duration::from_secs(10))
@@ -205,7 +276,11 @@ pub async fn invoke_plugin(entry: &registry::Entry, body: &Value) -> Response {
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_TIMEOUT_MS);
-    let base = endpoint.trim_end_matches('/');
+    let validated = match validate_plugin_endpoint(endpoint).await {
+        Ok(value) => value,
+        Err(error) => return err_env(StatusCode::BAD_REQUEST, "E_PLUGIN_ENDPOINT", &error),
+    };
+    let base = validated.as_str().trim_end_matches('/');
     match plugin_client()
         .post(format!("{base}/invoke"))
         .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -1498,6 +1573,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_endpoint_rejects_private_and_credential_urls() {
+        assert!(validate_plugin_endpoint("http://10.0.0.8:8080")
+            .await
+            .is_err());
+        assert!(validate_plugin_endpoint("http://169.254.169.254/latest")
+            .await
+            .is_err());
+        assert!(validate_plugin_endpoint("http://[::ffff:10.0.0.8]:8080")
+            .await
+            .is_err());
+        assert!(
+            validate_plugin_endpoint("https://user:pass@example.com/plugin")
+                .await
+                .is_err()
+        );
+        assert!(validate_plugin_endpoint("http://127.0.0.1:8787/plugin")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn register_validate_and_invoke_roundtrip() {
         let base = spawn_plugin().await;
         // 登记:manifest 拉取+校验+endpoint 回填
@@ -1739,13 +1835,55 @@ fn load_sources(codex_home: &std::path::Path) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn save_sources(codex_home: &std::path::Path, sources: &[Value]) {
+    let _ = save_sources_checked(codex_home, sources);
+}
+
+fn save_sources_checked(codex_home: &std::path::Path, sources: &[Value]) -> Result<(), String> {
     let p = sources_path(codex_home);
     let body = json!({ "version": 1, "sources": sources });
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, body.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
+    let parent = p
+        .parent()
+        .ok_or_else(|| "插件源文件缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建插件源目录失败: {e}"))?;
+    let tmp = parent.join(format!(
+        ".market-sources.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp, body.to_string()).map_err(|e| format!("写插件源临时文件失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置插件源文件权限失败: {e}"))?;
     }
+    #[cfg(windows)]
+    if p.exists() {
+        let old = parent.join(format!(
+            ".market-sources-old.{}.{}.bak",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::rename(&p, &old).map_err(|e| format!("替换旧插件源文件失败: {e}"))?;
+        if let Err(error) = std::fs::rename(&tmp, &p) {
+            let _ = std::fs::rename(&old, &p);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换插件源文件失败: {error}"));
+        }
+        let _ = std::fs::remove_file(old);
+    }
+    #[cfg(windows)]
+    if !p.exists() {
+        if let Err(error) = std::fs::rename(&tmp, &p) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换插件源文件失败: {error}"));
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(&tmp, &p).map_err(|e| format!("替换插件源文件失败: {e}"))?;
+    Ok(())
 }
 
 /// 拉取第三方源清单并校验(M5:schema_version 须识别;失败拒收整源)。
@@ -1951,8 +2089,10 @@ async fn handle_market_source_add(
         Ok(_) => {
             let mut sources = load_sources(&s.codex_home);
             sources.push(json!({ "id": id, "name": name, "url": url }));
-            save_sources(&s.codex_home, &sources);
-            raw_json(StatusCode::OK, &json!({ "ok": true, "id": id }))
+            match save_sources_checked(&s.codex_home, &sources) {
+                Ok(()) => raw_json(StatusCode::OK, &json!({ "ok": true, "id": id })),
+                Err(error) => err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_SOURCE_SAVE", &error),
+            }
         }
         Err(e) => err_env(StatusCode::BAD_REQUEST, "E_SOURCE_FETCH", &e),
     }
@@ -1968,11 +2108,13 @@ async fn handle_market_source_remove(
     let mut sources = load_sources(&s.codex_home);
     let before = sources.len();
     sources.retain(|x| x["id"] != id.as_str());
-    save_sources(&s.codex_home, &sources);
-    raw_json(
-        StatusCode::OK,
-        &json!({ "ok": true, "removed": before != sources.len() }),
-    )
+    match save_sources_checked(&s.codex_home, &sources) {
+        Ok(()) => raw_json(
+            StatusCode::OK,
+            &json!({ "ok": true, "removed": before != sources.len() }),
+        ),
+        Err(error) => err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_SOURCE_SAVE", &error),
+    }
 }
 
 /// 安装:官方源→内置条目直接登记;第三方源→拉清单→逐条目 manifest 校验→登记。
