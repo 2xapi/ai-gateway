@@ -434,6 +434,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         // --- 加速线路(阶段 4,任务书 §五)---
         .route("/api/accel/state", get(handle_accel_state))
+        .route(
+            "/api/settings/official-proxy",
+            get(handle_official_proxy).put(handle_official_proxy_save),
+        )
         .route("/api/accel/mode", post(handle_accel_mode))
         .route("/api/accel/custom-node", post(handle_accel_custom_node))
         .route("/api/accel/test-node", post(handle_accel_test_node))
@@ -1486,6 +1490,68 @@ pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) -> Result<()
     std::fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
 }
 
+/// 读「官方通道代理」（official-passthrough-gateway）：`official.proxyUrl` 段，空 = 直连。
+pub fn load_official_proxy(codex_home: &std::path::Path) -> String {
+    let raw = std::fs::read_to_string(accel_settings_path(codex_home)).unwrap_or_default();
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("official")
+        .and_then(|o| o.get("proxyUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 校验并保存「官方通道代理」；仅接受 http(s)/socks5(h)://，空串清空。
+pub fn save_official_proxy(codex_home: &std::path::Path, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    let ok = url.is_empty()
+        || ["http://", "https://", "socks5://", "socks5h://"]
+            .iter()
+            .any(|p| url.starts_with(p));
+    if !ok {
+        return Err("官方通道代理须为 http(s):// 或 socks5(h):// 地址，或留空".into());
+    }
+    let _save_guard = crate::usage_overlay::settings_write_lock()?;
+    std::fs::create_dir_all(codex_home).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let path = accel_settings_path(codex_home);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取配置失败: {e}")),
+    };
+    let mut value: Value = if raw.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&raw).map_err(|e| format!("配置文件格式错误: {e}"))?
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "配置文件根节点须为对象".to_string())?;
+    let mut official = object
+        .get("official")
+        .and_then(|o| o.as_object().cloned())
+        .unwrap_or_default();
+    official.insert("proxyUrl".into(), json!(url));
+    object.insert("official".into(), Value::Object(official));
+    let encoded =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, encoded).map_err(|e| format!("写临时配置失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置临时配置权限失败: {e}"))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("替换配置失败: {e}"))
+}
+
 fn validate_accel_endpoint(endpoint: &str) -> Result<String, &'static str> {
     let endpoint = endpoint.trim();
     let parsed = reqwest::Url::parse(endpoint).map_err(|_| "节点地址格式无效")?;
@@ -1854,6 +1920,40 @@ async fn handle_usage_overlay_action(
         "visible": settings.enabled,
         "settings": serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
     }))
+}
+
+/// 官方通道代理读取（脱敏：URL 内嵌凭据不回传）。
+async fn handle_official_proxy(State(s): State<Arc<AppState>>) -> Response {
+    let raw = load_official_proxy(&s.codex_home);
+    let masked = if raw.contains('@') {
+        match raw.split_once("://") {
+            Some((scheme, rest)) => match rest.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://***@{host}"),
+                None => raw,
+            },
+            None => raw,
+        }
+    } else {
+        raw
+    };
+    ok_env(json!({ "proxyUrl": masked }))
+}
+
+/// 官方通道代理保存；非法 scheme 400。
+async fn handle_official_proxy_save(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let url = body
+        .get("proxyUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    match save_official_proxy(&s.codex_home, &url) {
+        Ok(()) => ok_env(json!({ "saved": true })),
+        Err(e) => err_env(StatusCode::BAD_REQUEST, "E_OFFICIAL_PROXY", &e, None),
+    }
 }
 
 async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
@@ -4973,7 +5073,13 @@ mod tests {
             .await
             .unwrap();
         let v = body_json(resp).await;
-        assert_eq!(v["data"]["providers"].as_array().unwrap().len(), 1);
+        // 内置官方 ChatGPT 条目 + 新建 1 个 = 2
+        let providers = v["data"]["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0]["name"], "官方 ChatGPT");
+        assert!(providers
+            .iter()
+            .any(|p| p["id"] == json!(crate::providers::OFFICIAL_PROVIDER_ID)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6258,5 +6364,34 @@ mod tests {
         let v = accel_get(&build_router(state), "/api/accel/state").await;
         assert_eq!(v["mode"], "official");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// official-passthrough：官方通道代理设置的校验与读写（保留同文件其他段）。
+    #[test]
+    fn official_proxy_validation_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("2xapi-official-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 空默认 = 直连
+        assert_eq!(load_official_proxy(&dir), "");
+        // 非法 scheme 拒绝
+        assert!(save_official_proxy(&dir, "ftp://x").is_err());
+        assert!(save_official_proxy(&dir, "not a url").is_err());
+        // 合法形态接受
+        for ok in [
+            "http://127.0.0.1:7890",
+            "socks5://127.0.0.1:1080",
+            "socks5h://vpn.example:1080",
+            "",
+        ] {
+            save_official_proxy(&dir, ok).unwrap();
+            assert_eq!(load_official_proxy(&dir), ok);
+        }
+        // 保留同文件其他段（accel 等）
+        save_official_proxy(&dir, "socks5://127.0.0.1:1080").unwrap();
+        let raw = std::fs::read_to_string(dir.join("2xapi-settings.json")).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["official"]["proxyUrl"], "socks5://127.0.0.1:1080");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

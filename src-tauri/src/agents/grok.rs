@@ -206,7 +206,14 @@ mod tests {
         let id = create_provider(&providers_path, "T");
         let mut data: Value =
             serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
-        data["providers"][0]["agent"] = json!("codex");
+        // 按目标 id 定位（load 内置官方 ChatGPT 条目，禁止依赖下标）
+        let idx = data["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|p| p["id"] == json!(id))
+            .unwrap();
+        data["providers"][idx]["agent"] = json!("codex");
         std::fs::write(&providers_path, data.to_string()).unwrap();
 
         let error = host(&grok_home, &bk, &providers_path, &id, "gateway").unwrap_err();

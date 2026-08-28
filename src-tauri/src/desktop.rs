@@ -231,17 +231,13 @@ pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     } else {
         return Value::Null; // 第三方手写 custom(地址匹配禁止)→ 未托管
     };
-    let data = crate::providers::load(providers_path);
-    // 无任何供应商 → 未托管:config 残留托管 custom 段也不表达托管(空状态必须 hosting=null)
-    if data.providers.is_empty() {
-        return Value::Null;
-    }
-    let active = crate::providers::get_active_for_agent(providers_path, "codex");
-    let (id, name) = match active {
-        Some(provider) => (json!(provider.id), json!(provider.name)),
-        None => (Value::Null, Value::Null),
+    let active = match crate::providers::get_active_for_agent(providers_path, "codex") {
+        Some(provider) => provider,
+        // 无激活供应商（含仅剩内置官方条目未显式激活）：config 残留托管段
+        // 不表达托管——空状态必须 hosting=null。
+        None => return Value::Null,
     };
-    json!({ "providerId": id, "providerName": name, "way": way })
+    json!({ "providerId": active.id, "providerName": active.name, "way": way })
 }
 
 pub fn gateway_alive() -> bool {
@@ -263,6 +259,14 @@ pub fn state(config_path: &Path, providers_path: &Path, codex_home: &Path) -> Va
 }
 
 // ── host ─────────────────────────────────────────────────────
+
+/// 官方登录在位判定（official-passthrough-gateway）：SignedIn 时 overlay 写
+/// `requires_openai_auth = true`，CLI 携官方 Bearer 请求网关，官方账号功能保留。
+/// 探测不可用（Unknown/无 CLI）时回落 false，即纯 API 旧行为。
+fn official_signed_in(codex_home: &Path) -> bool {
+    crate::codex_security::probe_login_cached(codex_home).state
+        == crate::codex_security::LoginState::SignedIn
+}
 
 /// POST /api/desktop/host {providerId, way}
 pub fn host(
@@ -350,6 +354,7 @@ pub fn host(
                     &provider.model,
                     &catalog_path.to_string_lossy(),
                     before.sha256.as_deref(),
+                    official_signed_in(codex_home),
                 )
                 .map_err(io)?;
                 config_written = before.sha256 != after.sha256;
@@ -428,6 +433,7 @@ pub fn host(
                 &provider.model,
                 &catalog_path.to_string_lossy(),
                 before.sha256.as_deref(),
+                official_signed_in(codex_home),
             )
             .map_err(io)?;
             before.sha256 != after.sha256
@@ -1115,11 +1121,11 @@ mod tests {
         assert_eq!(h["way"], "gateway");
         assert_eq!(h["providerId"], "p1");
         assert_eq!(h["providerName"], "A");
-        // gateway 但无 active(状态破坏)→ way=gateway, providerId=null
+        // gateway 但无 active（状态破坏/仅剩内置官方未激活）→ 未托管(null)：
+        // 无激活供应商时 config 残留段不表达托管（official-passthrough 语义）
         crate::providers::clear_active(&prov);
         let h2 = detect_hosting(&cfg, &prov);
-        assert_eq!(h2["way"], "gateway");
-        assert!(h2["providerId"].is_null());
+        assert!(h2.is_null(), "无 active → hosting null:\n{h2}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = home;
     }

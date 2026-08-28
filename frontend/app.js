@@ -273,6 +273,28 @@ async function refreshAccel() {
     state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } };
   }
 }
+
+async function refreshOfficialProxy() {
+  try {
+    const v = await api.officialProxy();
+    state.officialProxy = (v && v.proxyUrl) || "";
+    state.officialProxyDraft = null;
+  } catch (e) {
+    state.officialProxy = state.officialProxy || "";
+  }
+}
+
+async function doSaveOfficialProxy() {
+  state.busy = "official-proxy"; render();
+  try {
+    await api.saveOfficialProxy((state.officialProxyDraft != null ? state.officialProxyDraft : (state.officialProxy || "")).trim());
+    await refreshOfficialProxy();
+    showToast("官方通道代理已保存", "ok");
+  } catch (e) {
+    showToast("保存失败：" + ((e && e.message) || "未知错误"), "error");
+  }
+  state.busy = null; state.officialProxyDraft = null; render();
+}
 async function refreshSession() {
   var requestSeq = ++state.sessionRequestSeq;
   var session = null;
@@ -669,6 +691,7 @@ function dashHtml() {
 function providerDetailCard(p) {
   var hb = hostedBy(p.id);
   var tagLabel = state.agent === "claude" ? "托管中" : "托管中";
+  var officialBuiltin = p.id === "official-chatgpt";
   var btns;
   if (state.agent === "claude") {
     btns = (hb
@@ -678,6 +701,12 @@ function providerDetailCard(p) {
       + '<button class="btn" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
       + (hb ? '<button class="btn ghost" disabled>删除(使用中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
+  } else if (officialBuiltin) {
+    /* 内置官方 ChatGPT：切换目标，不可编辑/删除；激活即网关透传官方后端 */
+    btns = (hb
+      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>停用 2xapi</button>'
+      : '<button class="btn primary" data-a="host-on" data-id="' + esc(p.id) + '"' + (state.busy === "host" ? " disabled" : "") + '>切换到官方</button>')
+      + '<button class="btn ghost" disabled>内置条目 · 不可编辑</button>';
   } else {
     /* Codex 世界:启用(未托管)/停用(已托管)+ 编辑 + 诊断 + 删除(托管中禁用)——与 Claude 分支同构 */
     btns = (hb
@@ -687,14 +716,17 @@ function providerDetailCard(p) {
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
       + (hb ? '<button class="btn ghost" disabled>删除(' + tagLabel + ')</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
   }
-  var html = '<section class="card"><div class="eyebrow" style="margin:0 0 2px">供应商详情 · ' + esc(p.name) + (hb ? ' <span class="tag on">' + tagLabel + '</span>' : '') + '</div>'
+  var modeLabel = officialBuiltin
+    ? "官方直连(经网关透传) · Official"
+    : (p.accessMode === "mixed" ? "保持官方登录 · Mixed" : "纯第三方 API · Pure API");
+  var html = '<section class="card"><div class="eyebrow" style="margin:0 0 2px">供应商详情 · ' + esc(p.name) + (officialBuiltin ? ' <span class="tag">内置</span>' : '') + (hb ? ' <span class="tag on">' + tagLabel + '</span>' : '') + '</div>'
     + '<div class="kv">'
-    + '<div><div class="k">上游地址</div><div class="v mono">' + esc(p.baseUrl) + '</div></div>'
-    + '<div><div class="k">api key</div><div class="v mono">' + esc(p.apiKeyMasked || "—") + '</div></div>'
-    + '<div><div class="k">协议</div><div class="v mono">' + esc(wireLabel(p)) + '</div></div>'
+    + '<div><div class="k">上游地址</div><div class="v mono">' + esc(officialBuiltin ? "官方 ChatGPT 后端（网关透传）" : p.baseUrl) + '</div></div>'
+    + '<div><div class="k">api key</div><div class="v mono">' + (officialBuiltin ? "官方登录凭据（不经 2xapi）" : esc(p.apiKeyMasked || "—")) + '</div></div>'
+    + '<div><div class="k">协议</div><div class="v mono">' + esc(officialBuiltin ? "responses" : wireLabel(p)) + '</div></div>'
     + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
-    + '<div><div class="k">接入模式</div><div class="v">' + esc(p.accessMode === "mixed" ? "保持官方登录 · Mixed" : "纯第三方 API · Pure API") + '</div></div>'
-    + '<div><div class="k">供应商独立代理</div><div class="v mono">' + esc(p.proxyUrl || "不使用") + '</div></div>'
+    + '<div><div class="k">接入模式</div><div class="v">' + esc(modeLabel) + '</div></div>'
+    + '<div><div class="k">供应商独立代理</div><div class="v mono">' + (officialBuiltin ? "使用「官方通道代理」设置" : esc(p.proxyUrl || "不使用")) + '</div></div>'
     + '</div>'
     + '<div class="btn-row">' + btns + '</div></section>';
   if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
@@ -3066,6 +3098,7 @@ function renderSettings() {
       return '<button class="set-tab ' + (state.setTab === x[0] ? "on" : "") + '" data-a="set-tab" data-s="' + x[0] + '">' + x[1] + '</button>';
     }).join("");
   }
+  if (state.setTab === "ip" && state.officialProxy == null) refreshOfficialProxy().then(render).catch(function () {});
   var body = document.getElementById("setBody");
   if (body) {
     body.innerHTML =
@@ -3122,7 +3155,11 @@ function setIpHtml() {
     + testHtml
     + '<div class="eyebrow" style="margin:14px 0 6px">官方加速凭证(每账号配额)</div>'
     + setRow('官方加速凭证', '<button class="btn sm ghost" data-a="ipm-refresh"' + (state.busy === "ipm" ? " disabled" : "") + '>' + (state.busy === "ipm" ? "刷新中…" : "刷新凭证") + '</button>',
-      usageLine(acc.usage) + ';配额用满会自动切直连,恢复后刷新即可重新加速。');
+      usageLine(acc.usage) + ';配额用满会自动切直连,恢复后刷新即可重新加速。')
+    + '<div class="eyebrow" style="margin:14px 0 6px">官方通道代理(Codex 官方直连出口)</div>'
+    + '<div class="sub" style="margin-bottom:6px">激活「官方 ChatGPT」供应商时,网关透传官方后端走此代理;留空=直连。直连不通 chatgpt.com 的环境(如部分 VM)必填。与上方加速线路、各供应商独立代理互不影响。</div>'
+    + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="officialProxyInput" data-a="official-proxy-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" value="' + esc(state.officialProxyDraft != null ? state.officialProxyDraft : (state.officialProxy || "")) + '">'
+    + '<button class="btn primary" data-a="official-proxy-save"' + (state.busy === "official-proxy" ? " disabled" : "") + '>' + (state.busy === "official-proxy" ? "保存中…" : "保存") + '</button></div>'
 }
 function usageLine(usage) {
   var u = (usage && usage.ok) ? usage : null;
@@ -4157,6 +4194,7 @@ document.addEventListener("click", function (ev) {
       renderSettings(); renderTopAuth(); break;
     case "ipm-toggle": break; /* 官方线路本期只读 */
     case "ipm-add": doIpmAdd(); break;
+    case "official-proxy-save": doSaveOfficialProxy(); break;
     case "ipm-enable": doIpmEnable(); break;
     case "ipm-del": doIpmDel(); break;
     case "ipm-test": doIpmTest(); break;
@@ -4437,6 +4475,7 @@ document.addEventListener("input", function (ev) {
     return;
   }
   if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
+  if (ev.target.id === "officialProxyInput") { state.officialProxyDraft = ev.target.value; return; }
   if (ev.target.dataset && ev.target.dataset.a === "usage-overlay-opacity") {
     state.usageOverlay.opacity = Math.max(60, Math.min(100, Number(ev.target.value) || 88));
     var output = ev.target.parentElement && ev.target.parentElement.querySelector("output");

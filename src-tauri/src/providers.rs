@@ -261,6 +261,25 @@ pub struct ProviderInput {
 
 // ── 存储读写（02 §3，原子写）─────────────────────────────────
 
+/// 内置「官方 ChatGPT」条目 id：网关透传官方后端的激活目标（official-passthrough-gateway）。
+pub const OFFICIAL_PROVIDER_ID: &str = "official-chatgpt";
+
+/// 内置官方条目固定形态：access_mode=Official、base_url 指向官方 codex 后端、无 key。
+pub fn official_provider() -> Provider {
+    Provider {
+        id: OFFICIAL_PROVIDER_ID.into(),
+        name: "官方 ChatGPT".into(),
+        agent: "codex".into(),
+        base_url: "https://chatgpt.com/backend-api/codex".into(),
+        api_key: String::new(),
+        access_mode: AccessMode::Official,
+        wire_api: WireApi::Responses,
+        model: "gpt-5.4".into(),
+        sort_index: i64::MIN,
+        ..Default::default()
+    }
+}
+
 pub fn load(path: &Path) -> ProviderData {
     let mut data: ProviderData = match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
@@ -273,6 +292,19 @@ pub fn load(path: &Path) -> ProviderData {
     // agent 存量归一化：旧文件缺省(serde 默认已补 codex)/ 非法值 → codex。不写回文件,除非后续保存。
     for p in &mut data.providers {
         p.agent = normalize_agent(&p.agent);
+    }
+    // 内置官方条目：缺失则补齐；存在则把固定字段规范回官方形态（防外部工具篡改）。
+    match data
+        .providers
+        .iter_mut()
+        .find(|p| p.id == OFFICIAL_PROVIDER_ID)
+    {
+        Some(p) => {
+            let preserved_sort = p.sort_index;
+            *p = official_provider();
+            p.sort_index = preserved_sort;
+        }
+        None => data.providers.push(official_provider()),
     }
     data.active_provider_ids.retain(|agent, id| {
         data.providers
@@ -531,9 +563,11 @@ pub fn format_errors(errs: &[ValidationError]) -> String {
 pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<ValidationError>> {
     validate(&input)?;
     let mut data = load(path);
+    // 官方内置条目（sort_index=i64::MIN 置顶）不参与用户序号计算，新建从 0 起。
     let sort_index = data
         .providers
         .iter()
+        .filter(|p| p.id != OFFICIAL_PROVIDER_ID)
         .map(|p| p.sort_index)
         .max()
         .unwrap_or(-1)
@@ -579,6 +613,12 @@ pub fn update(
     id: &str,
     input: ProviderInput,
 ) -> Result<Provider, Vec<ValidationError>> {
+    if id == OFFICIAL_PROVIDER_ID {
+        return Err(vec![ValidationError {
+            field: "id".into(),
+            message: "官方 ChatGPT 为内置条目，不可编辑".into(),
+        }]);
+    }
     let mut data = load(path);
     let updated = update_loaded(&mut data, id, input)?;
     save_atomic(path, &data, "update").map_err(io_errs)?;
@@ -592,6 +632,12 @@ pub fn update_from_value(
     id: &str,
     body: &Value,
 ) -> Result<Provider, Vec<ValidationError>> {
+    if id == OFFICIAL_PROVIDER_ID {
+        return Err(vec![ValidationError {
+            field: "id".into(),
+            message: "官方 ChatGPT 为内置条目，不可编辑".into(),
+        }]);
+    }
     let mut data = load(path);
     let Some(existing) = data.providers.iter().find(|p| p.id == id).cloned() else {
         return Err(vec![ValidationError {
@@ -762,6 +808,9 @@ pub fn delete(path: &Path, id: &str) {
 }
 
 pub fn delete_checked(path: &Path, id: &str) -> Result<(), String> {
+    if id == OFFICIAL_PROVIDER_ID {
+        return Err("官方 ChatGPT 为内置条目，不可删除".into());
+    }
     let mut data = load(path);
     let found = data.providers.iter().any(|p| p.id == id);
     data.providers.retain(|p| p.id != id);
@@ -791,6 +840,9 @@ pub fn reorder(path: &Path, ids: &[String]) {
 }
 
 pub fn reorder_checked(path: &Path, ids: &[String]) -> Result<(), String> {
+    if ids.iter().any(|id| id == OFFICIAL_PROVIDER_ID) {
+        return Err("官方 ChatGPT 为内置条目，不参与排序".into());
+    }
     let mut data = load(path);
     for (idx, id) in ids.iter().enumerate() {
         if let Some(p) = data.providers.iter_mut().find(|p| &p.id == id) {
@@ -908,7 +960,9 @@ pub fn get_provider_for_agent(path: &Path, agent: &str) -> Option<Provider> {
             return Some(p.clone());
         }
     }
-    if provs.len() == 1 {
+    // 单候选兼容（旧数据）：内置官方条目不参与自动激活——官方通道必须用户显式切换
+    //（official-passthrough-gateway 的 UI 显式切换决策）。
+    if provs.len() == 1 && provs[0].id != OFFICIAL_PROVIDER_ID {
         provs.into_iter().next()
     } else {
         None
@@ -1475,14 +1529,15 @@ mod tests {
         let pb = create(&path, b).expect("create2");
         assert_eq!(pb.sort_index, 1);
 
-        // 列表升序
+        // 列表升序：官方条目置顶，用户供应商按创建序
         let l = list(&path);
-        assert_eq!(l.len(), 2);
-        assert_eq!(l[0].name, "Alpha");
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[0].name, "官方 ChatGPT");
+        assert_eq!(l[1].name, "Alpha");
 
         // 重启后持久（重新从文件 load）
         let l2 = list(&path);
-        assert_eq!(l2.len(), 2);
+        assert_eq!(l2.len(), 3);
 
         // 编辑：name 变，created_at 不变
         let mut up = sample_input("Alpha2", AccessMode::PureApi);
@@ -1493,9 +1548,9 @@ mod tests {
         assert_eq!(updated.name, "Alpha2");
         assert_eq!(updated.created_at, pa.created_at);
 
-        // 删除
+        // 删除（剩 Beta + 内置官方）
         delete(&path, &pa.id);
-        assert_eq!(list(&path).len(), 1);
+        assert_eq!(list(&path).len(), 2);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1537,15 +1592,16 @@ mod tests {
         let b = create(&path, sample_input("B", AccessMode::Official)).unwrap();
         let c = create(&path, sample_input("C", AccessMode::Official)).unwrap();
 
-        // 新顺序：C, A, B
+        // 新顺序：C, A, B（官方条目恒置顶，不参与重排）
         reorder(&path, &[c.id.clone(), a.id.clone(), b.id.clone()]);
 
         let l = list(&path);
-        assert_eq!(l[0].name, "C");
-        assert_eq!(l[1].name, "A");
-        assert_eq!(l[2].name, "B");
+        assert_eq!(l[0].name, "官方 ChatGPT");
+        assert_eq!(l[1].name, "C");
+        assert_eq!(l[2].name, "A");
+        assert_eq!(l[3].name, "B");
         assert_eq!(
-            (l[0].sort_index, l[1].sort_index, l[2].sort_index),
+            (l[1].sort_index, l[2].sort_index, l[3].sort_index),
             (0, 1, 2)
         );
 
@@ -1565,9 +1621,12 @@ mod tests {
         }"#;
         std::fs::write(&path, legacy).unwrap();
         let data = load(&path);
-        assert_eq!(data.providers.len(), 1);
-        assert_eq!(data.providers[0].name, "Old");
-        assert!(matches!(data.providers[0].access_mode, AccessMode::PureApi));
+        // 内置官方条目自动补齐：legacy 1 条 + 官方 = 2
+        assert_eq!(data.providers.len(), 2);
+        let old = data.providers.iter().find(|p| p.id == "old-1").unwrap();
+        assert_eq!(old.name, "Old");
+        assert!(matches!(old.access_mode, AccessMode::PureApi));
+        assert!(data.providers.iter().any(|p| p.id == OFFICIAL_PROVIDER_ID));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1600,11 +1659,17 @@ mod tests {
 
         let raw = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        // 三次写(2 create + 1 set_active)各一条审计
         assert_eq!(lines.len(), 3, "三次写应有三条审计:\n{raw}");
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["op"], "create");
-        assert_eq!(first["count"], 1);
-        assert_eq!(first["providers"][0]["name"], "AuditA");
+        // count 含内置官方条目：官方 + 新建 1 = 2
+        assert_eq!(first["count"], 2);
+        assert!(first["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "AuditA"));
         let third: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(third["op"], "set_active");
         assert_eq!(third["active"], a.id);
@@ -1626,8 +1691,9 @@ mod tests {
         assert_eq!(p.reasoning_levels, Some(vec!["low".into(), "high".into()]));
         // 重载后仍在
         let data = load(&path);
+        let reloaded = data.providers.iter().find(|x| x.id == p.id).unwrap();
         assert_eq!(
-            data.providers[0].reasoning_levels,
+            reloaded.reasoning_levels,
             Some(vec!["low".into(), "high".into()])
         );
         let _ = std::fs::remove_file(&path);
@@ -1657,8 +1723,9 @@ mod tests {
 
         // 持久化后仍在
         let data = load(&path);
+        let reloaded = data.providers.iter().find(|x| x.id == p3.id).unwrap();
         assert_eq!(
-            data.providers[0].reasoning_levels,
+            reloaded.reasoning_levels,
             Some(vec!["medium".into(), "high".into()])
         );
         let _ = std::fs::remove_file(&path);
@@ -1775,7 +1842,8 @@ mod tests {
         let p = create(&path, i).expect("create");
         assert_eq!(p.user_agent.as_deref(), Some("curl/8.6.0"));
         let data = load(&path);
-        assert_eq!(data.providers[0].user_agent.as_deref(), Some("curl/8.6.0"));
+        let reloaded = data.providers.iter().find(|x| x.id == p.id).unwrap();
+        assert_eq!(reloaded.user_agent.as_deref(), Some("curl/8.6.0"));
 
         // value_to_input 接 userAgent / user_agent;缺省 → None(不清旧档)
         assert_eq!(
@@ -1805,8 +1873,9 @@ mod tests {
         let p2 = update(&path, &p.id, up).expect("update");
         assert_eq!(p2.user_agent.as_deref(), Some("Mozilla/5.0 Chrome/126"));
         let data = load(&path);
+        let reloaded2 = data.providers.iter().find(|x| x.id == p.id).unwrap();
         assert_eq!(
-            data.providers[0].user_agent.as_deref(),
+            reloaded2.user_agent.as_deref(),
             Some("Mozilla/5.0 Chrome/126")
         );
 
@@ -2061,5 +2130,56 @@ mod tests {
             Some(WireApi::Responses)
         ));
         assert!(WireApi::parse("grpc").is_none());
+    }
+
+    /// official-passthrough-gateway：内置官方条目的注入、保护与显式激活语义。
+    #[test]
+    fn official_entry_builtin_protected() {
+        let path = tmp_path("official-builtin");
+        // 空文件 → load 自动注入官方条目
+        std::fs::write(&path, "{}").unwrap();
+        let data = load(&path);
+        let official = data
+            .providers
+            .iter()
+            .find(|p| p.id == OFFICIAL_PROVIDER_ID)
+            .expect("load 应注入官方条目");
+        assert!(matches!(official.access_mode, AccessMode::Official));
+        assert_eq!(official.base_url, "https://chatgpt.com/backend-api/codex");
+
+        // 不可删除 / 不可编辑 / 不参与 reorder
+        assert!(delete_checked(&path, OFFICIAL_PROVIDER_ID).is_err());
+        assert!(update_from_value(&path, OFFICIAL_PROVIDER_ID, &json!({"name":"x"})).is_err());
+        assert!(reorder_checked(&path, &[OFFICIAL_PROVIDER_ID.into()]).is_err());
+
+        // 外部工具篡改固定字段 → load 规范化复原
+        //（拦截操作不触盘，先落盘一份含官方条目的文件模拟外部工具视角）
+        store(&path, &load(&path)).unwrap();
+        let mut raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let idx = raw["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|p| p["id"] == json!(OFFICIAL_PROVIDER_ID))
+            .unwrap();
+        raw["providers"][idx]["base_url"] = json!("https://evil.example");
+        raw["providers"][idx]["access_mode"] = json!("pure_api");
+        std::fs::write(&path, raw.to_string()).unwrap();
+        let healed = load(&path)
+            .providers
+            .into_iter()
+            .find(|p| p.id == OFFICIAL_PROVIDER_ID)
+            .unwrap();
+        assert_eq!(healed.base_url, "https://chatgpt.com/backend-api/codex");
+        assert!(matches!(healed.access_mode, AccessMode::Official));
+
+        // 仅剩官方条目（未显式激活）→ 不自动激活，保持「请先选择供应商」
+        assert!(get_provider_for_agent(&path, "codex").is_none());
+        // 显式激活官方 → 网关命中官方条目（透传分支依据）
+        set_active(&path, OFFICIAL_PROVIDER_ID);
+        let active = get_provider_for_agent(&path, "codex").unwrap();
+        assert_eq!(active.id, OFFICIAL_PROVIDER_ID);
+        let _ = std::fs::remove_file(&path);
     }
 }

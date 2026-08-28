@@ -524,7 +524,13 @@ mod tests {
     fn host_writes_only_safe_role_models_to_profile() {
         let (root, cd_home, providers_path, provider_id) = fixture("all-models");
         let mut data = crate::providers::load(&providers_path);
-        data.providers[0].models = vec![
+        // 按目标 id 定位（load 内置官方 ChatGPT 条目，禁止依赖下标）
+        let idx = data
+            .providers
+            .iter()
+            .position(|p| p.id == provider_id)
+            .unwrap();
+        data.providers[idx].models = vec![
             crate::providers::ModelConfig {
                 name: "claude-test".into(),
                 ..Default::default()
@@ -538,7 +544,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        data.providers[0].claude_desktop_model_routes = vec![
+        data.providers[idx].claude_desktop_model_routes = vec![
             crate::providers::ClaudeDesktopModelRoute {
                 role: "sonnet".into(),
                 model: "gpt-5.6".into(),
@@ -683,7 +689,14 @@ mod tests {
         let (root, cd_home, providers_path, provider_id) = fixture("foreign-agent");
         let mut data: Value =
             serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
-        data["providers"][0]["agent"] = json!("cursor");
+        // 按目标 id 定位（load 会内置官方 ChatGPT 条目，禁止依赖数组下标）
+        let idx = data["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|p| p["id"] == json!(provider_id))
+            .unwrap();
+        data["providers"][idx]["agent"] = json!("cursor");
         std::fs::write(&providers_path, data.to_string()).unwrap();
 
         let error = host(&cd_home, &providers_path, &provider_id, "gateway").unwrap_err();

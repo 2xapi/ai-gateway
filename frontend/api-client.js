@@ -341,6 +341,12 @@
 
     // ── 加速(阶段 4,任务书 §…):mode off|official|custom;customNode 仅本机保存 ──
     // GET /api/accel/state 返回非信封 {mode,customNode,lines[],scopeNote}(字段在顶层),失败时可能 {ok:false,error};用 rawJson 解顶层字段
+
+    // ── 官方通道代理(official-passthrough):网关透传官方后端的专用出口 ──
+    officialProxy: () => request("GET", "/api/settings/official-proxy"),
+    saveOfficialProxy: (proxyUrl) =>
+      request("PUT", "/api/settings/official-proxy", { proxyUrl }),
+
     accelState: async () => {
       const p = await rawJson("GET", "/api/accel/state");
       if (p && p.ok === false) {

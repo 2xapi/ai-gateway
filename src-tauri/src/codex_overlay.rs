@@ -355,13 +355,13 @@ fn read_doc(path: &Path) -> Result<DocumentMut, String> {
         .map_err(|e| format!("E_CODEX_CONFIG_PARSE: {e}"))
 }
 
-fn ensure_provider(doc: &mut DocumentMut, base_url: &str) {
+fn ensure_provider(doc: &mut DocumentMut, base_url: &str, official_auth: bool) {
     let providers = doc["model_providers"].or_insert(table());
     let provider = providers[PROVIDER_ID].or_insert(table());
     provider["name"] = value(PROVIDER_NAME);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(false);
+    provider["requires_openai_auth"] = value(official_auth);
     // 每次 host 都移除旧 direct/认证字段，但不触碰其他 provider。
     if let Some(table) = provider.as_table_like_mut() {
         table.remove("env_key");
@@ -370,12 +370,15 @@ fn ensure_provider(doc: &mut DocumentMut, base_url: &str) {
     }
 }
 
+/// `official_auth`：官方登录在位（SignedIn）时为 true——CLI 携官方 Bearer 请求网关，
+/// 激活官方条目即透传官方后端；未登录时 false，CLI 走纯 API 语义（零官方依赖）。
 pub fn apply_gateway(
     path: &Path,
     base_url: &str,
     model: &str,
     catalog_path: &str,
     expected_sha256: Option<&str>,
+    official_auth: bool,
 ) -> Result<FileFingerprint, String> {
     let before = fingerprint(path)?;
     if expected_sha256 != before.sha256.as_deref() && expected_sha256.is_some() {
@@ -391,7 +394,7 @@ pub fn apply_gateway(
         doc["model"] = value(model);
     }
     doc["model_catalog_json"] = value(catalog_path);
-    ensure_provider(&mut doc, base_url);
+    ensure_provider(&mut doc, base_url, official_auth);
     write_atomic(path, doc.to_string().as_bytes(), Some(&before))?;
     fingerprint(path)
 }
@@ -474,6 +477,7 @@ mod tests {
             "gpt-test",
             "/tmp/catalog.json",
             None,
+            false,
         )
         .unwrap();
         let raw = fs::read_to_string(&path).unwrap();
@@ -497,7 +501,8 @@ mod tests {
             "http://127.0.0.1:8787",
             "gpt-test",
             "catalog",
-            Some(&hash)
+            Some(&hash),
+            false
         )
         .is_err());
         let _ = fs::remove_dir_all(dir);
@@ -512,7 +517,15 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, "# keep\nmodel_provider = \"openai\"\nmodel = \"user-model\"\n[model_providers.custom]\nbase_url = \"https://user.example\"\n").unwrap();
         let baseline = new_baseline(&path).unwrap();
-        apply_gateway(&path, "http://127.0.0.1:8787", "gpt-test", "catalog", None).unwrap();
+        apply_gateway(
+            &path,
+            "http://127.0.0.1:8787",
+            "gpt-test",
+            "catalog",
+            None,
+            false,
+        )
+        .unwrap();
         record_applied_state(&path, &backups, Some(baseline), None).unwrap();
         let sidecar = overlay_state_path(&backups);
         let result = restore_owned_fields(&path, &sidecar, None).unwrap();
@@ -534,7 +547,15 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, "model_provider = \"openai\"\n").unwrap();
         let baseline = new_baseline(&path).unwrap();
-        apply_gateway(&path, "http://127.0.0.1:8787", "gpt-test", "catalog", None).unwrap();
+        apply_gateway(
+            &path,
+            "http://127.0.0.1:8787",
+            "gpt-test",
+            "catalog",
+            None,
+            false,
+        )
+        .unwrap();
         record_applied_state(&path, &backups, Some(baseline), None).unwrap();
         fs::write(&path, "model_provider = \"user-selected\"\n").unwrap();
         let result = restore_owned_fields(&path, &overlay_state_path(&backups), None).unwrap();
@@ -555,9 +576,15 @@ mod tests {
         let path = dir.join("config.toml");
         let original = "[broken\n";
         fs::write(&path, original).unwrap();
-        assert!(
-            apply_gateway(&path, "http://127.0.0.1:8787", "gpt-test", "catalog", None).is_err()
-        );
+        assert!(apply_gateway(
+            &path,
+            "http://127.0.0.1:8787",
+            "gpt-test",
+            "catalog",
+            None,
+            false
+        )
+        .is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let _ = fs::remove_dir_all(dir);
     }
