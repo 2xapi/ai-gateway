@@ -99,8 +99,53 @@ var state = {
 };
 
 var $ = function (s) { return document.querySelector(s); };
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"';]/g, function (c) {
+/* ── 代理表单共用:分字段 ↔ URL ── */
+var PROXY_SCHEMES = [["http", "HTTP"], ["https", "HTTPS"], ["socks5", "SOCKS5"], ["socks5h", "SOCKS5H · 远程DNS"]];
+function parseProxyUrl(url) {
+  var out = { scheme: "http", host: "", port: "", user: "", pass: "" };
+  if (!url) return out;
+  var m = String(url).trim().match(/^(socks5h|socks5|https|http):\/\/(?:([^:@/]*)(?::([^@/]*))?@)?([^:/?#]+)(?::(\d+))?/i);
+  if (!m) return out;
+  out.scheme = m[1].toLowerCase(); out.host = m[4] || ""; out.port = m[5] || "";
+  var dec = function (v) { try { return decodeURIComponent(v); } catch (e) { return v; } };
+  out.user = (m[2] != null && m[2] !== "***") ? dec(m[2]) : "";
+  out.pass = (m[3] != null && m[3] !== "***") ? dec(m[3]) : "";
+  return out;
+}
+function buildProxyUrl(parts) {
+  if (!parts || !parts.host || !String(parts.host).trim()) return "";
+  var scheme = parts.scheme || "http";
+  var host = String(parts.host).trim();
+  var port = String(parts.port || "").trim();
+  var user = String(parts.user || "").trim();
+  var pass = String(parts.pass || "");
+  var auth = user ? encodeURIComponent(user) + ":" + encodeURIComponent(pass) + "@" : "";
+  return scheme + "://" + auth + host + (port ? ":" + port : "");
+}
+function fillProxyFields(prefix, url) {
+  var p = parseProxyUrl(url);
+  var set = function (id, v) { var el = document.getElementById(prefix + id); if (el) el.value = v; };
+  set("Scheme", p.scheme); set("Host", p.host); set("Port", p.port); set("User", p.user); set("Pass", p.pass);
+}
+function readProxyFields(prefix) {
+  var get = function (id) { var el = document.getElementById(prefix + id); return el ? el.value : ""; };
+  return buildProxyUrl({ scheme: get("Scheme"), host: get("Host"), port: get("Port"), user: get("User"), pass: get("Pass") });
+}
+function proxyFormHtml(prefix, portPlaceholder) {
+  var opts = PROXY_SCHEMES.map(function (s) {
+    return '<option value="' + s[0] + '"' + (s[0] === "http" ? " selected" : "") + ">" + s[1] + "</option>";
+  }).join("");
+  var inp = 'style="min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)"';
+  return '<div class="grid2" style="gap:8px">'
+    + '<div class="f"><label style="font-size:11px">协议</label><select id="' + prefix + 'Scheme" ' + inp + ' data-a="' + prefix.toLowerCase() + '-proxy-field">' + opts + '</select></div>'
+    + '<div class="f" style="grid-column:span 2"><label style="font-size:11px">主机</label><input class="mono" id="' + prefix + 'Host" placeholder="127.0.0.1 或 vpn.example.com" ' + inp + ' data-a="' + prefix.toLowerCase() + '-proxy-field"></div>'
+    + '<div class="f"><label style="font-size:11px">端口</label><input class="mono" id="' + prefix + 'Port" type="number" min="1" max="65535" placeholder="' + (portPlaceholder || "8080") + '" ' + inp + ' data-a="' + prefix.toLowerCase() + '-proxy-field"></div>'
+    + '<div class="f"><label style="font-size:11px">用户名(可选)</label><input class="mono" id="' + prefix + 'User" autocomplete="off" ' + inp + ' data-a="' + prefix.toLowerCase() + '-proxy-field"></div>'
+    + '<div class="f"><label style="font-size:11px">密码(可选)</label><input class="mono" id="' + prefix + 'Pass" type="password" autocomplete="new-password" ' + inp + ' data-a="' + prefix.toLowerCase() + '-proxy-field"></div>'
+    + '</div>';
+}
+
+function esc(s) {  return String(s == null ? "" : s).replace(/[&<>"';]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", ";": "&#59;" }[c];
   });
 }
@@ -285,9 +330,11 @@ async function refreshOfficialProxy() {
 }
 
 async function doSaveOfficialProxy() {
+  /* 先取值再 render(busy 态会重绘表单清空 DOM 字段) */
+  const url = state.officialProxyDraft != null ? state.officialProxyDraft : readProxyFields("op");
   state.busy = "official-proxy"; render();
   try {
-    await api.saveOfficialProxy((state.officialProxyDraft != null ? state.officialProxyDraft : (state.officialProxy || "")).trim());
+    await api.saveOfficialProxy(url);
     await refreshOfficialProxy();
     showToast("官方通道代理已保存", "ok");
   } catch (e) {
@@ -2464,9 +2511,9 @@ function openEdit(id) {
   var modeSel = document.getElementById("eMode");
   if (modeWrap) modeWrap.style.display = isCodex ? "" : "none";
   if (modeSel) { modeSel.value = isCodex ? state.edit.accessMode : "pure_api"; modeSel.disabled = !isCodex; }
-  var proxyEl = document.getElementById("eProxy");
+  var proxyEl = document.getElementById("eProxyHost");
   var timeoutEl = document.getElementById("eTimeout");
-  if (proxyEl) proxyEl.value = state.edit.proxyUrl || "";
+  if (proxyEl) fillProxyFields("eProxy", state.edit.proxyUrl || "");
   if (timeoutEl) timeoutEl.value = state.edit.timeoutSecs || "";
   var wSel = document.getElementById("eWire");
   /* 新建一律显示「自动」(保存时落世界默认值,拉取模型探测后回写);编辑已有供应商显示当前实际协议 */
@@ -2492,7 +2539,7 @@ function collectEdit() {
     baseUrl: $("#eUrl").value.trim(),
     apiKey: $("#eKey").value,
     model: $("#eModel").value.trim(),
-    proxyUrl: ($("#eProxy") || { value: "" }).value.trim(),
+    proxyUrl: readProxyFields("eProxy"),
     timeoutSecs: ($("#eTimeout") || { value: "" }).value.trim(),
   };
 }
@@ -3108,6 +3155,10 @@ function renderSettings() {
       : state.setTab === "general" ? setGeneralHtml()
       : state.setTab === "advanced" ? setAdvancedHtml()
       : setAboutHtml();
+    /* innerHTML 之后回填（元素此时才存在）：draft(输入中)优先，否则已保存值 */
+    if (state.setTab === "ip" && state.officialProxy != null) {
+      fillProxyFields("op", state.officialProxyDraft != null ? state.officialProxyDraft : state.officialProxy);
+    }
     return;
   }
   var usageBody = document.getElementById("usagePageBody");
@@ -3157,9 +3208,10 @@ function setIpHtml() {
     + setRow('官方加速凭证', '<button class="btn sm ghost" data-a="ipm-refresh"' + (state.busy === "ipm" ? " disabled" : "") + '>' + (state.busy === "ipm" ? "刷新中…" : "刷新凭证") + '</button>',
       usageLine(acc.usage) + ';配额用满会自动切直连,恢复后刷新即可重新加速。')
     + '<div class="eyebrow" style="margin:14px 0 6px">官方通道代理(Codex 官方直连出口)</div>'
-    + '<div class="sub" style="margin-bottom:6px">激活「官方 ChatGPT」供应商时,网关透传官方后端走此代理;留空=直连。直连不通 chatgpt.com 的环境(如部分 VM)必填。与上方加速线路、各供应商独立代理互不影响。</div>'
-    + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="officialProxyInput" data-a="official-proxy-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" value="' + esc(state.officialProxyDraft != null ? state.officialProxyDraft : (state.officialProxy || "")) + '">'
-    + '<button class="btn primary" data-a="official-proxy-save"' + (state.busy === "official-proxy" ? " disabled" : "") + '>' + (state.busy === "official-proxy" ? "保存中…" : "保存") + '</button></div>'
+    + '<div class="sub" style="margin-bottom:6px">激活「官方 ChatGPT」供应商时,网关透传官方后端走此代理;主机留空=直连。直连不通 chatgpt.com 的环境(如部分 VM)必填。与上方加速线路、各供应商独立代理互不影响。SOCKS5H 为远程 DNS 解析(推荐,DNS 污染环境 SOCKS5 可能连假 IP)。</div>'
+    + '<div class="mg-tools" style="margin-top:8px;display:block">'
+    + proxyFormHtml("op", "1080")
+    + '<div class="btn-row" style="margin-top:8px"><button class="btn primary" data-a="official-proxy-save"' + (state.busy === "official-proxy" ? " disabled" : "") + '>' + (state.busy === "official-proxy" ? "保存中…" : "保存官方通道代理") + '</button></div></div>'
 }
 function usageLine(usage) {
   var u = (usage && usage.ok) ? usage : null;
@@ -4446,6 +4498,11 @@ document.addEventListener("change", function (ev) {
     plug2LocalFile(t);
     return;
   }
+  /* 官方通道代理表单协议下拉:change 同步 draft(select 不发 input) */
+  if (t && t.id && /^op(Scheme|Host|Port|User|Pass)$/.test(t.id)) {
+    state.officialProxyDraft = readProxyFields("op");
+    return;
+  }
 });
 document.addEventListener("input", function (ev) {
   if (ev.target.dataset && ev.target.dataset.a === "search") {
@@ -4475,7 +4532,11 @@ document.addEventListener("input", function (ev) {
     return;
   }
   if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
-  if (ev.target.id === "officialProxyInput") { state.officialProxyDraft = ev.target.value; return; }
+  /* 官方通道代理表单:任一字段输入 → 拼 URL 存 draft(重绘防丢) */
+  if (/^op(Scheme|Host|Port|User|Pass)$/.test(ev.target.id)) {
+    state.officialProxyDraft = readProxyFields("op");
+    return;
+  }
   if (ev.target.dataset && ev.target.dataset.a === "usage-overlay-opacity") {
     state.usageOverlay.opacity = Math.max(60, Math.min(100, Number(ev.target.value) || 88));
     var output = ev.target.parentElement && ev.target.parentElement.querySelector("output");

@@ -345,7 +345,7 @@
     // ── 官方通道代理(official-passthrough):网关透传官方后端的专用出口 ──
     officialProxy: () => request("GET", "/api/settings/official-proxy"),
     saveOfficialProxy: (proxyUrl) =>
-      request("PUT", "/api/settings/official-proxy", { proxyUrl }),
+      request("PUT", "/api/settings/official-proxy", { body: { proxyUrl } }),
 
     accelState: async () => {
       const p = await rawJson("GET", "/api/accel/state");

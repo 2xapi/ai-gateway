@@ -1922,21 +1922,9 @@ async fn handle_usage_overlay_action(
     }))
 }
 
-/// 官方通道代理读取（脱敏：URL 内嵌凭据不回传）。
+/// 官方通道代理读取（完整值返回：本机 token 鉴权下的本人设置页，表单回填需要）。
 async fn handle_official_proxy(State(s): State<Arc<AppState>>) -> Response {
-    let raw = load_official_proxy(&s.codex_home);
-    let masked = if raw.contains('@') {
-        match raw.split_once("://") {
-            Some((scheme, rest)) => match rest.rsplit_once('@') {
-                Some((_, host)) => format!("{scheme}://***@{host}"),
-                None => raw,
-            },
-            None => raw,
-        }
-    } else {
-        raw
-    };
-    ok_env(json!({ "proxyUrl": masked }))
+    ok_env(json!({ "proxyUrl": load_official_proxy(&s.codex_home) }))
 }
 
 /// 官方通道代理保存；非法 scheme 400。
