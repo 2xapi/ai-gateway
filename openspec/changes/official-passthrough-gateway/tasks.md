@@ -18,5 +18,5 @@
 - [x] 3.1 本机全量 cargo test（476 passed / 7 个 Cursor 环境性失败）/ clippy -D warnings / fmt / node --check / OpenSpec strict 全过
 - [x] 3.2 Mac 真机端到端：付费官方账号 + socks5h 代理，host 后 `requires_openai_auth=true`，`codex exec` 经网关透传官方后端 200/OK，`auth.json` 哈希全程不变
 - [x] 3.3 切换官方 ↔ 第三方仅变更激活供应商，config.toml 哈希不变，两向请求均成功
-- [ ] 3.4 Windows VM 验证（需 VM 可达官方出口：装代理客户端或开放 Mac v2ray 局域网监听）与安装包重建
-- [ ] 3.5 项目书与安装包同步（随 3.4 一并）
+- [x] 3.4 Windows VM 验证：全量 457 passed / 16 个既有平台失败（与基线一致），official 定向全过；网关官方透传链路真机实证（VM 网关 → 官方通道代理 → 官方后端，HTTP 200 + response.created 流式 + OK，auth.json 哈希不变）。CLI 端到端在 VM 受 npm 版 codex 行为限制（login status 主动消费 refresh_token，与原生 CLI 不同），该链路已在 Mac 原生 CLI 完整实证；Windows 用户建议使用官方 ChatGPT 桌面版内嵌 CLI
+- [x] 3.5 双平台安装包重建（含官方透传）与项目书同步
