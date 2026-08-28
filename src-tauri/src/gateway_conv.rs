@@ -42,7 +42,7 @@ pub fn responses_to_chat_request(body: &[u8]) -> Result<ConvertedRequest, String
                         "developer" => "system",
                         r => r,
                     };
-                    let content = extract_text(item.get("content"));
+                    let content = extract_content(item.get("content"));
                     messages.push(json!({ "role": role, "content": content }));
                 } else if let Some(s) = item.as_str() {
                     messages.push(json!({ "role": "user", "content": s }));
@@ -164,6 +164,60 @@ fn zero_usage() -> Value {
 }
 
 /// 从 Responses 的 content（字符串 或 [{type:..,text:..}]）抽出文本。
+/// responses content → chat content。纯文本保持 String（与旧链路字节兼容）；
+/// 含 input_image 时转 chat 多模态数组（image_url data URL），不再丢图
+///（2026-08-29 用户实测发图模型不识别的根因即旧 extract_text 只取 text 字段）。
+fn extract_content(content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::Array(arr)) => {
+            let mut parts: Vec<Value> = Vec::new();
+            let mut text_only = String::new();
+            let mut has_image = false;
+            for p in arr {
+                let ptype = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match ptype {
+                    "input_image" | "image_url" => {
+                        // responses: {"type":"input_image","image_url":"data:..."}（file_id 暂无本地文件可解析,跳过）
+                        if let Some(url) = p.get("image_url").and_then(|u| u.as_str()) {
+                            if !url.is_empty() {
+                                parts.push(
+                                    json!({ "type": "image_url", "image_url": { "url": url } }),
+                                );
+                                has_image = true;
+                            }
+                        } else if let Some(url) = p
+                            .get("image_url")
+                            .and_then(|u| u.get("url"))
+                            .and_then(|u| u.as_str())
+                        {
+                            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                            has_image = true;
+                        }
+                    }
+                    "input_text" | "text" | "" => {
+                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                            parts.push(json!({ "type": "text", "text": t }));
+                            text_only.push_str(t);
+                        } else if let Some(s) = p.as_str() {
+                            parts.push(json!({ "type": "text", "text": s }));
+                            text_only.push_str(s);
+                        }
+                    }
+                    _ => {} // reasoning 等无法映射的条目丢弃（与旧行为一致）
+                }
+            }
+            if has_image {
+                Value::Array(parts)
+            } else {
+                Value::String(text_only)
+            }
+        }
+        _ => Value::String(String::new()),
+    }
+}
+
+#[allow(dead_code)] // 供历史引用/对照；生产链路已用 extract_content
 fn extract_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
@@ -399,6 +453,41 @@ fn fmt(event: &str, data: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-08-29 用户实测发图不识别的根因回归：input_image 必须转成 chat image_url，不得丢弃。
+    #[test]
+    fn converts_image_content_to_chat_multimodal() {
+        let body = r#"{"model":"m","input":[{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"这是什么"},
+            {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
+        ]}],"stream":false}"#
+            .as_bytes();
+        let conv = responses_to_chat_request(body).unwrap();
+        let v: Value = serde_json::from_slice(&conv.body).unwrap();
+        let msgs = v.get("messages").unwrap().as_array().unwrap();
+        let content = &msgs[0]["content"];
+        let arr = content.as_array().expect("含图消息 content 应为数组");
+        assert_eq!(arr.len(), 2, "文本+图片两部分都要保留:\n{content}");
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "这是什么");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(
+            arr[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    /// 纯文本消息保持 String content（与旧链路字节兼容，上游不需多模态解析）。
+    #[test]
+    fn text_only_content_stays_string() {
+        let body = r#"{"model":"m","input":[{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"纯文本"}
+        ]}],"stream":false}"#
+            .as_bytes();
+        let conv = responses_to_chat_request(body).unwrap();
+        let v: Value = serde_json::from_slice(&conv.body).unwrap();
+        assert_eq!(v["messages"][0]["content"], "纯文本");
+    }
 
     #[test]
     fn converts_request_messages() {
