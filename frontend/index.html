@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'" />
+<title>2xapi Codex Console</title>
+<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <span class="brand-logo"><img src="brand-logo.svg" alt="2xapi"></span><span class="brand">2xapi Console</span><span class="app-version-badge" id="appVersionBadge">v1.0.14</span>
+    <span class="spacer"></span>
+    <span class="chip" id="gwChip"><span class="led"></span>gateway 127.0.0.1:8787</span>
+    <span class="chip"><b id="hostChip">未托管</b></span>
+    <span class="spacer" style="flex:0 0 8px"></span>
+    <span id="topAuth"></span>
+  </header>
+
+  <div class="frame" id="frame">
+    <!-- ① agent 图标导航(骨架:现在 Codex,未来 Claude/更多) -->
+    <nav class="nav">
+      <button class="nav-btn agent on" style="--ac:var(--c-gw)" data-a="agent" data-g="codex" title="Codex">
+        <svg fill="#E8ECF4" fill-rule="evenodd" height="19" viewBox="0 0 24 24" width="19" xmlns="http://www.w3.org/2000/svg"><title>OpenAI</title><path d="M21.55 10.004a5.416 5.416 0 00-.478-4.501c-1.217-2.09-3.662-3.166-6.05-2.66A5.59 5.59 0 0010.831 1C8.39.995 6.224 2.546 5.473 4.838A5.553 5.553 0 001.76 7.496a5.487 5.487 0 00.691 6.5 5.416 5.416 0 00.477 4.502c1.217 2.09 3.662 3.165 6.05 2.66A5.586 5.586 0 0013.168 23c2.443.006 4.61-1.546 5.361-3.84a5.553 5.553 0 003.715-2.66 5.488 5.488 0 00-.693-6.497v.001zm-8.381 11.558a4.199 4.199 0 01-2.675-.954c.034-.018.093-.05.132-.074l4.44-2.53a.71.71 0 00.364-.623v-6.176l1.877 1.069c.02.01.033.029.036.05v5.115c-.003 2.274-1.87 4.118-4.174 4.123zM4.192 17.78a4.059 4.059 0 01-.498-2.763c.032.02.09.055.131.078l4.44 2.53c.225.13.504.13.73 0l5.42-3.088v2.138a.068.068 0 01-.027.057L9.9 19.288c-1.999 1.136-4.552.46-5.707-1.51h-.001zM3.023 8.216A4.15 4.15 0 015.198 6.41l-.002.151v5.06a.711.711 0 00.364.624l5.42 3.087-1.876 1.07a.067.067 0 01-.063.005l-4.489-2.559c-1.995-1.14-2.679-3.658-1.53-5.63h.001zm15.417 3.54l-5.42-3.088L14.896 7.6a.067.067 0 01.063-.006l4.489 2.557c1.998 1.14 2.683 3.662 1.529 5.633a4.163 4.163 0 01-2.174 1.807V12.38a.71.71 0 00-.363-.623zm1.867-2.773a6.04 6.04 0 00-.132-.078l-4.44-2.53a.731.731 0 00-.729 0l-5.42 3.088V7.325a.068.068 0 01.027-.057L14.1 4.713c2-1.137 4.555-.46 5.707 1.513.487.833.664 1.809.499 2.757h.001zm-11.741 3.81l-1.877-1.068a.065.065 0 01-.036-.051V6.559c.001-2.277 1.873-4.122 4.181-4.12.976 0 1.92.338 2.671.954-.034.018-.092.05-.131.073l-4.44 2.53a.71.71 0 00-.365.623l-.003 6.173v.002zm1.02-2.168L12 9.25l2.414 1.375v2.75L12 14.75l-2.415-1.375v-2.75z"></path></svg><span class="tip">Codex(桌面版/CLI)</span>
+      </button>
+      <button class="nav-btn agent" style="--ac:var(--c-claude)" data-a="agent" data-g="claude" title="Claude Code">
+        <svg height="19" viewBox="0 0 24 24" width="19" xmlns="http://www.w3.org/2000/svg"><title>Claude</title><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z" fill="#D97757" fill-rule="nonzero"></path></svg><span class="tip">Claude Code(配置托管)</span>
+      </button>
+      <button class="nav-btn agent" style="--ac:var(--c-direct)" data-a="agent" data-g="hermes" title="Hermes">
+        <img src="data:image/png;base64,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" width="19" height="19" style="display:block;border-radius:4px" alt="Hermes"><span class="tip">Hermes(叠加托管)</span>
+      </button>
+      <!-- 未实现的 agent 平台由 app.js 从 /api/desktop/agents 注册表动态注入「即将上线」占位(A 阶段,D3) -->
+      <div class="nav-sep"></div>
+      <div class="nav-foot">
+        <button class="nav-btn" id="nv-plug" style="--ac:var(--c-plug)" data-a="view" data-v="plug"><span>🧩</span><span class="tip">插件与能力市场</span></button>
+        <button class="nav-btn" id="nv-eco" style="--ac:var(--c-gw)" data-a="view" data-v="eco"><span>🌱</span><span class="tip">生态中心(MCP 管理)</span></button>
+        <button class="nav-btn" id="nv-usage" style="--ac:var(--c-gw)" data-a="view" data-v="usage"><span>▥</span><span class="tip">使用统计</span></button>
+        <button class="nav-btn" id="nv-history" style="--ac:var(--c-gw)" data-a="view" data-v="history"><span>🕘</span><span class="tip">历史会话</span></button>
+        <button class="nav-btn" id="nv-settings" style="--ac:var(--c-gw)" data-a="settings-open"><span>⚙</span><span class="tip">设置(IP 管理 · 账号 · 通用…)</span></button>
+      </div>
+    </nav>
+
+    <!-- ② 供应商栏(仅 Codex 的 dash 视图显示;history / Claude 收中栏) -->
+    <div class="rail">
+      <div class="rail-scroll no-bar" id="railList"></div>
+    </div>
+
+    <!-- ③ 主区 -->
+    <main class="content no-bar" id="content"></main>
+  </div>
+</div>
+
+<!-- 编辑供应商弹窗 -->
+<!-- 预设供应商选择层 -->
+<div class="mask" id="presetMask" style="display:none">
+  <div class="box preset-box">
+    <h3>新建供应商 · 从预设选择</h3>
+    <input id="presetSearch" class="mono" placeholder="搜索厂商或端点…" autocomplete="off">
+    <div class="preset-grid no-bar" id="presetGrid"></div>
+    <div class="btn-row" style="justify-content:space-between;margin-top:10px">
+      <button class="btn" data-a="preset-manual">手动填写(不用预设)</button>
+      <button class="btn" data-a="preset-close">取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="mask" id="editMask" style="display:none">
+  <div class="box" id="editBox">
+    <h3 id="editTitle">编辑供应商</h3>
+    <div class="box-body no-bar">
+      <div class="grid2">
+        <div class="f" style="grid-column:1/-1"><label>名称 *</label><input id="eName"></div>
+        <div class="f" style="grid-column:1/-1" id="eModeWrap"><label>接入模式</label><select id="eMode">
+          <option value="mixed">保持官方登录 + 第三方混合 (Mixed)</option>
+          <option value="pure_api">纯第三方 API (Pure API)</option>
+        </select><div class="sub">Mixed 会保留 Codex 官方 OAuth/keyring，只把第三方请求交给本地网关；不会把中转 Key 写入 auth.json。</div></div>
+        <div class="f" style="grid-column:1/-1"><label>上游地址 *</label><input class="mono" id="eUrl"></div>
+        <div class="f" style="grid-column:1/-1"><label>api key · 留空不修改</label><input type="password" class="mono" id="eKey" placeholder="sk-..."></div>
+        <div class="f"><label>默认模型 *</label><input class="mono" id="eModel" placeholder="点「拉取模型」后自动填入"></div>
+        <div class="f"><label>协议</label><select id="eWire">
+          <option value="auto">自动(探测上游)</option>
+          <option value="responses">Responses</option>
+          <option value="chat_completions">ChatCompletions</option>
+          <option value="anthropic">Messages(Anthropic)</option>
+        </select></div>
+        <div class="f" style="grid-column:1/-1"><label>UA 伪装 · 上游反封锁(可选)</label><select id="eUa">
+          <option value="">默认(网关)</option>
+          <option value="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36">浏览器 · Chrome macOS</option>
+          <option value="curl/8.6.0">curl</option>
+          <option value="PostmanRuntime/7.37.3">Postman</option>
+          <option value="OpenAI/Python 1.35.0">OAI SDK (openai-python)</option>
+        </select></div>
+      </div>
+      <section id="claudeDesktopRoutes" style="display:none;margin-top:12px">
+        <div class="eyebrow">Claude Desktop 模型映射</div>
+        <div class="sub" style="margin-top:4px">Claude Desktop 菜单只使用四个合法角色 ID；实际请求由本地网关映射到供应商模型。空档自动沿用 Sonnet（或第一个已填档）。</div>
+        <table class="mtable claude-route-table">
+          <thead><tr><th>模型角色</th><th>菜单显示名</th><th>实际请求模型</th><th>声明支持 1M</th></tr></thead>
+          <tbody id="claudeDesktopRouteRows"></tbody>
+        </table>
+        <datalist id="claudeDesktopModelOptions"></datalist>
+      </section>
+      <table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody id="modelRows"></tbody></table>
+      <div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="mfetch">⤓ 拉取模型</button><button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button></div>
+      <details style="margin-top:8px"><summary class="eyebrow" style="cursor:pointer">高级(供应商独立代理 · 超时 · 备注)</summary><div style="margin-top:8px"><label>供应商独立代理（留空主机 = 直连）</label><div class="grid2" style="margin-top:6px"><div class="f"><label>协议</label><select id="eProxyScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H · 远程 DNS</option></select></div><div class="f"><label>主机</label><input class="mono" id="eProxyHost" placeholder="127.0.0.1"></div><div class="f"><label>端口</label><input class="mono" id="eProxyPort" type="number" min="1" max="65535" placeholder="8080"></div><div class="f"><label>用户名（可选）</label><input class="mono" id="eProxyUser" autocomplete="off"></div><div class="f"><label>密码（可选）</label><input class="mono" id="eProxyPass" type="password" autocomplete="new-password"></div></div><div class="sub">只影响该供应商的上游请求；带认证的旧代理重新编辑时请重填用户名/密码。</div></div><div class="grid2" style="margin-top:8px"><div class="f"><label>上游超时(秒)</label><input class="mono" id="eTimeout" type="number" min="5" max="3600" placeholder="默认 120"></div></div><div class="sub" style="margin-top:6px">协议默认自动(拉取模型时探测回写);上游兼容 Responses / ChatCompletions 时网关自动转换;Messages 供 Claude 供应商使用。</div></details>
+    </div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="edit-save">保存</button><button class="btn ghost" data-a="close-edit">取消</button></div>
+  </div>
+</div>
+
+<!-- 一键导入 Key 向导(登录后自动弹 / 头像菜单进入) -->
+<div class="mask" id="impMask" style="display:none" data-a="imp-close">
+  <div class="box" style="width:460px">
+    <h3 style="margin:0 0 4px">⇭ 一键导入 Key</h3>
+    <div class="sub">勾选要导入的 Key,自动拉取模型、生成供应商,无需手动填写。</div>
+    <div class="box-body no-bar" id="impBody"></div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn primary" id="impSubmit" data-a="imp-do">导入选中</button><button class="btn ghost" id="impCancel" data-a="imp-close">取消</button></div>
+  </div>
+</div>
+
+<!-- 登录 2xapi 账号(邮箱/密码 + 记住我;站点开启验证码时弹出滑块) -->
+<div class="mask" id="loginMask" style="display:none" data-a="login-close">
+  <div class="box" style="width:360px">
+    <h3 style="margin:0 0 4px">登录 2xapi 账号</h3>
+    <div class="sub">登录后可一键导入你的 Key,自动生成供应商。</div>
+    <div id="loginForm"></div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn primary" id="loginSubmit" data-a="do-login">登录</button><button class="btn ghost" id="loginCancel" data-a="login-close">取消</button></div>
+  </div>
+</div>
+
+<div id="toastRoot"></div>
+<!-- 用量悬浮窗：默认由设置控制隐藏，桌面原生独立窗口接入前先提供同样的信息结构。 -->
+<aside id="usageOverlay" class="usage-overlay" style="display:none" aria-label="今日用量悬浮窗"></aside>
+<div class="confirm-mask" id="confirmMask" style="display:none">
+  <div class="confirm-box">
+    <div class="confirm-title" id="cfTitle"></div>
+    <div class="confirm-msg" id="cfMsg"></div>
+    <div class="btn-row" style="margin:0">
+      <button class="btn danger" id="cfYes" data-a="confirm-yes">确认</button>
+      <button class="btn ghost" data-a="confirm-no">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="./api-client.js"></script>
+<script src="./presets.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2xapi Codex Console — UI 方案预览</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e2333;--card:#252b3d;--border:#2a2f3a;--text:#e6e8ee;--muted:#8b93a4;--primary:#4f8cff;--ok:#3fb950;--warn:#d29922;--radius:12px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"PingFang SC","Segoe UI",sans-serif;overflow:hidden;height:100vh}
+.app{display:flex;height:100vh}
+
+/* 侧边栏 */
+.sidebar{width:60px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:8px}
+.sidebar .nav-btn{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;background:transparent;border:1px solid transparent;cursor:pointer;color:var(--muted);transition:.15s}
+.sidebar .nav-btn.active{background:var(--panel2);border-color:var(--primary);color:var(--primary)}
+.sidebar .nav-btn:hover{background:var(--panel2);color:var(--text)}
+.sidebar .sep{width:28px;height:1px;background:var(--border);margin:4px 0}
+.sidebar .dot{width:8px;height:8px;border-radius:50%;background:var(--primary);margin:3px 0}
+.sidebar .dot.green{background:var(--ok)} .sidebar .dot.orange{background:var(--warn)}
+
+/* 主区 */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+.topbar .logo{font-weight:700;font-size:16px}
+.topbar .spacer{flex:1}
+.topbar .pill{display:flex;align-items:center;gap:6px;padding:5px 12px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;font-size:12px}
+.topbar .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+.topbar .btn{padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);cursor:pointer;font-size:12px}
+.topbar .btn:hover{border-color:var(--primary)}
+
+/* 卡片区 */
+.content{flex:1;overflow-y:auto;padding:16px 20px}
+.section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;transition:.15s;position:relative}
+.card:hover{border-color:var(--primary);transform:translateY(-2px);box-shadow:0 4px 20px rgba(79,140,255,.1)}
+.card.active{border-left:3px solid var(--primary)}
+.card .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.card .head .name{font-weight:600;font-size:15px}
+.card .head .star{color:var(--primary)}
+.card .head .badge{font-size:10px;padding:2px 8px;border-radius:999px;font-weight:500}
+.badge.active{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.mixed{background:rgba(79,140,255,.15);color:var(--primary)}
+.badge.official{background:rgba(63,185,80,.15);color:var(--ok)}
+.badge.pure{background:rgba(210,153,34,.15);color:var(--warn)}
+.card .tags{display:flex;gap:6px;margin-bottom:10px}
+.card .tag{font-size:10px;padding:2px 8px;border-radius:6px;background:var(--panel);color:var(--muted)}
+.card .model{font-size:12px;color:var(--muted);margin-bottom:12px}
+.card .actions{display:flex;gap:6px;flex-wrap:wrap}
+.card .act{font-size:11px;padding:5px 10px;border-radius:7px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer}
+.card .act:hover{border-color:var(--primary)}
+.card .act.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+
+.new-card{border:1.5px dashed var(--border);border-radius:var(--radius);display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--muted);cursor:pointer;padding:20px;transition:.15s}
+.new-card:hover{border-color:var(--primary);color:var(--primary)}
+
+/* 详情面板 */
+.detail{background:var(--panel);border-top:1px solid var(--border);padding:16px 20px;max-height:280px;overflow-y:auto}
+.detail h3{font-size:13px;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.detail h3 .badge{font-size:10px;padding:2px 8px;border-radius:999px}
+.mode-selector{display:flex;gap:8px;margin-bottom:12px}
+.mode-card{flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;text-align:center;cursor:pointer;background:var(--panel2)}
+.mode-card.selected{border-color:var(--primary);background:rgba(79,140,255,.08)}
+.mode-card .t{font-weight:600;font-size:12px} .mode-card .s{font-size:10px;color:var(--muted)}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.field{display:flex;flex-direction:column;gap:3px}
+.field label{font-size:10px;color:var(--muted)}
+.field input,.field select{padding:6px 8px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px}
+.detail-actions{display:flex;gap:8px;margin-top:10px}
+.detail-actions .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);cursor:pointer;font-size:12px}
+.detail-actions .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+
+</style></head>
+<body>
+<div class="app">
+  <!-- 侧边栏 -->
+  <div class="sidebar">
+    <div class="nav-btn active">📋</div>
+    <div class="nav-btn">🔄</div>
+    <div class="nav-btn">🛠</div>
+    <div class="nav-btn">⚙️</div>
+    <div class="sep"></div>
+    <div class="dot green"></div>
+    <div class="dot"></div>
+    <div class="dot orange"></div>
+  </div>
+  <!-- 主区 -->
+  <div class="main">
+    <div class="topbar">
+      <div class="logo">2xapi Codex Console</div>
+      <div class="spacer"></div>
+      <div class="pill"><span class="dot"></span>DeepSeek · Mixed</div>
+      <button class="btn">🛠 工具箱</button>
+      <button class="btn">⇄ 切官方</button>
+    </div>
+    <div class="content">
+      <div class="section-title">供应商</div>
+      <div class="cards">
+        <!-- DeepSeek (active) -->
+        <div class="card active">
+          <div class="head">
+            <span class="star">★</span>
+            <span class="name">DeepSeek</span>
+            <span class="badge active">✅ 已激活</span>
+          </div>
+          <div class="tags">
+            <span class="badge mixed">Mixed</span>
+            <span class="tag">ChatCompletions</span>
+          </div>
+          <div class="model">deepseek-chat · 2 个模型 · ctx 64K</div>
+          <div class="actions">
+            <button class="act primary">激活</button>
+            <button class="act">编辑</button>
+            <button class="act">诊断</button>
+            <button class="act">预览</button>
+          </div>
+        </div>
+        <!-- OpenAI -->
+        <div class="card">
+          <div class="head">
+            <span class="name">OpenAI</span>
+          </div>
+          <div class="tags">
+            <span class="badge official">Official</span>
+            <span class="tag">Responses</span>
+          </div>
+          <div class="model">gpt-4o · 官方直连</div>
+          <div class="actions">
+            <button class="act primary">激活</button>
+            <button class="act">编辑</button>
+            <button class="act">诊断</button>
+          </div>
+        </div>
+        <!-- 智谱 -->
+        <div class="card">
+          <div class="head">
+            <span class="name">智谱</span>
+          </div>
+          <div class="tags">
+            <span class="badge pure">PureApi</span>
+            <span class="tag">Responses</span>
+          </div>
+          <div class="model">glm-5.2 · 3 个模型 · ctx 128K</div>
+          <div class="actions">
+            <button class="act primary">激活</button>
+            <button class="act">编辑</button>
+            <button class="act">诊断</button>
+          </div>
+        </div>
+      </div>
+      <div class="new-card">+ 新建供应商</div>
+    </div>
+    <!-- 详情/编辑面板 -->
+    <div class="detail">
+      <h3>编辑: DeepSeek <span class="badge mixed">Mixed</span></h3>
+      <div class="mode-selector">
+        <div class="mode-card"><div class="t">官方登录</div><div class="s">Official</div></div>
+        <div class="mode-card selected"><div class="t">保持官登+API</div><div class="s">Mixed</div></div>
+        <div class="mode-card"><div class="t">第三方API</div><div class="s">PureApi</div></div>
+      </div>
+      <div class="form-grid">
+        <div class="field" style="grid-column:1/-1"><label>名称</label><input value="DeepSeek"></div>
+        <div class="field" style="grid-column:1/-1"><label>Base URL</label><input value="https://api.deepseek.com"></div>
+        <div class="field"><label>API Key</label><input type="password" value="sk-82...2904"></div>
+        <div class="field"><label>协议</label><select><option>ChatCompletions</option><option>Responses</option></select></div>
+        <div class="field"><label>默认模型</label><input value="deepseek-chat"></div>
+        <div class="field"><label>超时(秒)</label><input value="120"></div>
+      </div>
+      <div class="detail-actions">
+        <button class="btn primary">💾 保存</button>
+        <button class="btn">👁 预览 config</button>
+        <button class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+</body></html>

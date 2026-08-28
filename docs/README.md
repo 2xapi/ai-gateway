@@ -1,136 +1,117 @@
-# AI Gateway 项目文档
+# 2xapi Codex Console — 开发流程文档套装
 
-## 项目概述
+> 目标：把「模型供应商管理系统」分里程碑交给 API 开发，**做到每个里程碑一次验收通过**。
+> 本套装 = 流程宪法 + 冻结契约 + 可测试需求 + 任务清单 + UI 规范 + 喂给 API 的指令模板。
 
-AI多服务商/账号智能中转网关是一个统一管理多个AI服务商API的智能网关系统。
+---
 
-### 核心特性
+## 一、文档索引
 
-- **多服务商支持**: 统一接口支持 OpenAI、Anthropic、Azure OpenAI 等
-- **智能路由**: 基于成本、可用性、配额自动选择最优服务商
-- **智能限流**: 用户级和全局级的请求和Token限额控制
-- **智能缓存**: 减少重复请求，降低成本
-- **监控仪表盘**: 实时监控使用量和成本
-- **一键部署**: Docker Compose 一键启动所有服务
+| 文档 | 一句话 | 何时读 |
+|---|---|---|
+| [00_开发流程总纲](00_开发流程总纲.md) | 流程宪法：里程碑 M0~M7、验收 Gate、AI 协作纪律、回退流程 | 每次必读 |
+| [01_产品概述与需求冻结](01_产品概述与需求冻结.md) | 三种接入模式 + **行为契约矩阵** + **v2 歧义澄清(D1~D7)** | M2/M3/M6 前必读；**人需先确认 §6** |
+| [02_数据模型与契约](02_数据模型与契约.md) | Provider 结构 + **三模式 config.toml/auth.json 产物契约表** | M0/M1/M2（冻结） |
+| [03_功能需求详细设计](03_功能需求详细设计.md) | 各模块可测试需求 FR-x.y（含第三方中转站使用统计） | M3/M4/M5/M6 |
+| [04_接口设计](04_接口设计.md) | Provider、使用统计和网关 HTTP 路由的请求/响应 schema + 错误码 + TS 类型 | M3/M4/M5/M6（冻结） |
+| [05_里程碑任务清单与验收标准](05_里程碑任务清单与验收标准.md) | M0~M7 原子任务 + 每条 DoD + 用户验收 checklist | 每个里程碑的执行+验收依据 |
+| [06_前端页面设计](06_前端页面设计.md) | 每页 ASCII 布局 + 元素 + 交互 + API 映射 | M6 |
+| [07_API开发指令模板](07_API开发指令模板.md) | 通用 prompt 骨架 + 每里程碑填充卡 + CCR/交付块模板 | **人喂给 API 时用** |
+| [竞品吸收与 P0 变更](../openspec/changes/p0-config-profiles-doctor-session-control/proposal.md) | 配置档案、Provider Doctor 2.0、会话修复任务控制的规格、设计与实施任务 | 当前施工 |
 
-## 目录结构
+---
+
+## 二、⚠️ 开始前，人必须先确认 01 §6 的 7 条决策
+
+我在 01 §6 对 v2 开发文档里的**模糊/自相矛盾处**做了去歧义决策。这些是冻结契约的基础，**请你过目**；若有不同意见，改 01 即可（走 CCR），改完再开工。最关键的 4 条：
+
+| ID | 歧义 | 我的决策 | 影响面 |
+|---|---|---|---|
+| **D1** | Official 走不走网关？ | **不走**，Codex 直连官方 | 架构/网关 |
+| **D2** | Mixed 的 key 注在 config.toml 还是网关？ | **只注网关**，config 不设 experimental_bearer_token | M2/M3 |
+| **D3** | 网关用谁的 key 转发？ | **统一用 provider.api_key**（Provider Store 为唯一真相源） | M3 |
+| **D4** | PureApi 覆盖官方后怎么恢复？ | 切换前备份 `auth.json.official.bak`，activate-official 时恢复 | M2 |
+
+另三条：D5（协议转换方向：Codex 恒发 Responses，Chat 模式由网关转换）、D6（Sub2API 本期 stub）、D7（热切换只影响下一请求）。
+
+> 这 7 条一旦你认可，整套契约就自洽了，API 没有自由发挥的灰色地带——这是"一次验收通过"的前提。
+
+---
+
+## 三、运行模式（agent 自驱 + 自动测试）
+
+> ⚙️ **新模式（2026-08-13）**：由 agent 自驱开发——按里程碑顺序实现 → 写并跑 `cargo test` → 全绿 + DoD 自检 → 自动产出交付块并进入下一里程碑，**里程碑之间不等人**。人工仅在 ① 契约变更 CCR ② M7 最终验收 ③ agent 连续失败 时介入。下方「三步启动」为旧的人工驱动流程，保留备查。
 
 ```
-ai-gateway/
-├── gateway/                 # Go 后端网关核心
-│   ├── cmd/server/         # 应用入口
-│   ├── internal/           # 内部包
-│   │   ├── config/        # 配置管理
-│   │   ├── handler/       # HTTP 处理器
-│   │   ├── middleware/    # 中间件
-│   │   ├── model/         # 数据模型
-│   │   ├── proxy/         # 代理逻辑
-│   │   ├── router/        # 路由设置
-│   │   ├── service/       # 业务逻辑
-│   │   └── utils/         # 工具函数
-│   └── pkg/               # 公共包
-│       ├── cache/         # 缓存实现
-│       └── logger/        # 日志模块
-│
-├── console/                # Vue3 前端控制台
-│   ├── src/
-│   │   ├── components/   # 组件
-│   │   ├── views/        # 页面
-│   │   ├── router/       # 路由
-│   │   ├── store/        # 状态管理
-│   │   ├── api/          # API 调用
-│   │   └── assets/       # 静态资源
-│   └── public/           # 公共文件
-│
-├── deploy/                 # 部署配置
-│   ├── docker/           # Docker 配置
-│   │   ├── docker-compose.yml
-│   │   └── Dockerfile
-│   └── nginx/            # Nginx 配置
-│       └── nginx.conf
-│
-├── docs/                   # 文档
-├── scripts/                # 脚本
-│   ├── start.sh          # 开发启动
-│   └── docker.sh         # Docker 部署
-│
-└── configs/               # 配置文件
-    └── config.example.yaml
+每个里程碑重复以下三步：
+
+1) 拼 prompt
+   打开 07：复制 §1 通用骨架
+            + 复制 §2 对应里程碑卡的「输入文档」章节（去 01/02/04 取原文粘贴）
+            + 复制 05 该里程碑的任务表作为「范围」
+   → 整段粘贴给 API
+
+2) API 实现 + 自检 + 交付块（附录B 格式）
+
+3) 你验收
+   按 §2 该里程碑的「验收 checklist」+ 05 的 DoD + 附录C 通用项 逐条验
+   ├─ 全过 → 进入下一里程碑（回到第 1 步）
+   └─ 不过 → 按 00 §6 回退流程：局部修复 / 整段重做 / 触发契约复审
 ```
 
-## 技术栈
+**里程碑顺序**：M0 → M1 → (M2 ‖ M3) → M4 → (M5 ‖ M6) → M7
 
-### 后端
-- **语言**: Go 1.21+
-- **框架**: Gin
-- **数据库**: SQLite (GORM)
-- **缓存**: Redis (可选)
-- **日志**: Logrus
+---
 
-### 前端
-- **框架**: Vue 3
-- **UI 库**: Element Plus
-- **状态管理**: Pinia
-- **构建工具**: Vite
-- **图表**: ECharts
+## 四、项目验收 = M7 用户验收 checklist 全勾
 
-### 部署
-- **容器化**: Docker + Docker Compose
-- **反向代理**: Nginx
+见 [05 末尾](05_里程碑任务清单与验收标准.md#用户验收-checklistm7)。覆盖：三模式对话、热切换不重启、协议转换、诊断三步、备份恢复、不破坏用户配置、代理/超时、无崩溃。
 
-## 快速开始
+---
 
-### 本地开发
+## 五、目录结构（建议）
 
-```bash
-# 1. 复制配置文件
-cp configs/config.example.yaml configs/config.yaml
-
-# 2. 编辑配置，添加 API Key
-vim configs/config.yaml
-
-# 3. 启动服务
-./scripts/start.sh
+```
+2xapi-codex-console/
+├── docs/                      ← 本套装（契约层，给人+API读）
+│   ├── 00_开发流程总纲.md
+│   ├── 01_产品概述与需求冻结.md
+│   ├── 02_数据模型与契约.md
+│   ├── 03_功能需求详细设计.md
+│   ├── 04_接口设计.md
+│   ├── 05_里程碑任务清单与验收标准.md
+│   ├── 06_前端页面设计.md
+│   ├── 07_API开发指令模板.md
+│   └── README.md              ← 本文件
+├── src-tauri/                 ← M0 起生成
+│   └── src/{main,server,gateway,providers,config,probe,diagnose}.rs
+├── dist/                      ← 前端
+│   └── {app.js,styles.css,api-client.js}
+└── 08_产品完善建议.md          ← API/人冒出的改进想法记这里，不混入实现
 ```
 
-### Docker 部署
+---
 
-```bash
-# 构建并启动
-./scripts/docker.sh build
-./scripts/docker.sh up
+## 六、当前新增模块
 
-# 查看日志
-./scripts/docker.sh logs
+第三方中转站使用统计已纳入项目契约：
 
-# 停止服务
-./scripts/docker.sh down
-```
+- 首页账号区域显示今日 Token、缓存命中率和费用摘要，并可进入完整统计页。
+- 左侧「使用统计」进入第三方中转站用量页面；设置中的「用量」分区也保留同一套统计和悬浮窗配置，包含历史日聚合、时间范围趋势、模型排行和缓存效率。
+- 统计支持按 `provider_id` 筛选，并支持 7/30/90 日时间范围；缓存命中率在缺少必要字段时显示「暂无数据」。
+- 统计只覆盖经本地网关转发的第三方请求；Official 直连不计入。
+- usage、缓存或费用字段缺失时显示「暂无数据」，不使用估算值冒充真实数据。
+- 统计接口和数据模型见 `01` §8、`02` §6、`03` FR-10、`04` §1.5、`06` §7~§11。
+- 可选透明用量悬浮窗默认关闭，支持 `60%~100%` 透明度（默认 `88%`）、置顶、鼠标穿透、悬停恢复、刷新间隔和位置记忆；见 `01` §8.5、`02` §6.2、`03` FR-11、`04` §1.6、`06` §9。
 
-## API 端点
+## 七、一句话
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/health` | GET | 健康检查 |
-| `/api/v1/chat/completions` | POST | 聊天补全 (OpenAI 兼容) |
-| `/api/v1/completions` | POST | 文本补全 |
-| `/api/v1/embeddings` | POST | 向量嵌入 |
-| `/api/v1/providers` | GET/POST | 服务商管理 |
-| `/api/v1/users` | GET/POST | 用户管理 |
-| `/api/v1/keys` | GET/POST | API 密钥管理 |
-| `/api/v1/stats` | GET | 统计数据 |
+> **契约冻结在前（01§6+02+04），任务原子化在中（05），逐段验收在后（每里程碑 Gate），证据随交付闭环（07附录B）。**
+> 做到这四点，"一次验收通过"是默认结果。
+## 桌面端迁移说明
 
-## 环境变量
+本仓库当前承载 2xapi Codex Console 桌面端源码，技术栈为 Tauri 2 + Rust。迁移前的 ai-gateway Go 服务保存在 Git 分支 legacy-ai-gateway-20260820，便于回溯。
 
-| 变量 | 描述 |
-|------|------|
-| `AIG_SERVER_PORT` | 服务端口 |
-| `AIG_REDIS_HOST` | Redis 主机 |
-| `AIG_REDIS_PORT` | Redis 端口 |
-| `OPENAI_API_KEY` | OpenAI API Key |
-| `ANTHROPIC_API_KEY` | Anthropic API Key |
-| `AZURE_OPENAI_API_KEY` | Azure OpenAI Key |
+在线更新源为：
 
-## 许可证
-
-MIT License
+https://github.com/2xapi/ai-gateway/releases/latest/download/latest.json

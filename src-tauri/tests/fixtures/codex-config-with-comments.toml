@@ -1,0 +1,15 @@
+# Fixture: user-owned comments and provider data must survive a 2xapi overlay.
+model_provider = "openai"
+model = "gpt-user"
+
+[model_providers.custom]
+name = "User Custom"
+base_url = "https://user.example.invalid/v1"
+wire_api = "responses"
+
+[mcp_servers.example]
+command = "example-mcp"
+args = ["--safe"]
+
+[notice]
+enabled = true

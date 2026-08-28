@@ -1,74 +1,11 @@
-# Binaries
-bin/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-ai-gateway
-gateway
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/gen/schemas/
+web/
 
-# Test binary, built with `go test -c`
-*.test
+# 打包产物
+*.app
 
-# Output of the go coverage tool
-*.out
-coverage.html
-coverage/
-
-# Go workspace file
-go.work
-
-# Dependency directories
-vendor/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
+# macOS
 .DS_Store
-Thumbs.db
-
-# Environment files
-.env
-.env.local
-.env.*.local
-.webui_secret_key
-
-# Config files with secrets
-configs/config.json
-!configs/config.example.json
-
-# Data directory
-data/
-*.db
-*.db-journal
-
-# Logs
-*.log
-logs/
-
-# Docker
-.docker/
-
-# Temporary files
-tmp/
-temp/
-.worktrees/
-
-# Frontend
-web/node_modules/
-web/dist/
-web/.npm/
-web/.eslintcache
-web/*.local
-
-# Test artifacts (local only)
-test-screenshots/
-playwright-report/
-test-results/
-.nyc_output/
+.claude/worktrees/

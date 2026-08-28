@@ -1,0 +1,178 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: macos-${{ matrix.arch }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+      - name: Import Apple Developer certificate
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/developer_cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+      - name: Build signed bundles
+        working-directory: src-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple 签名/公证:tauri-bundler 仅在 APPLE_CERTIFICATE env 存在或 signingIdentity
+          # 已配置时才签名(不会自动扫描 keychain),故证书与密码必须传入 Build 步
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # 公证凭据(app-specific password);未配置则跳过公证
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # secrets 未配置时 APPLE_* 为空字符串,tauri-bundler 会把空值当作"已提供"并尝试导入空证书;
+          # 显式 unset,让 bundler 走"未配置→不签名"路径
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          cargo tauri build --target ${{ matrix.target }} --bundles dmg,app
+      - name: Normalize release assets
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          root="src-tauri/target/$TARGET/release/bundle"
+          mkdir -p release-assets
+          updater_sig=$(find "$root" -type f -name '*.app.tar.gz.sig' -print -quit)
+          test -n "$updater_sig"
+          updater_file=${updater_sig%.sig}
+          cp "$updater_file" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz"
+          cp "$updater_sig" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz.sig"
+          dmg=$(find "$root" -type f -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          cp "$dmg" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+      - name: Build signed bundles
+        working-directory: src-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Normalize release assets
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $root = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          # 只发布 standalone EXE 安装器(不做增量 zip 与 MSI,减少发布面)
+          $exeSig = Get-ChildItem "$root/nsis" -Filter "*.exe.sig" | Select-Object -First 1
+          if (-not $exeSig) { throw "Windows installer signature not found" }
+          $exeUpdater = $exeSig.FullName.Substring(0, $exeSig.FullName.Length - 4)
+          $name = "2xapi-codex-console_${version}_windows_x86_64.exe"
+          Copy-Item $exeUpdater "release-assets/$name"
+          Copy-Item $exeSig.FullName "release-assets/$name.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate signed updater manifest
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=${TAG#v}
+          base_url="https://github.com/$REPO/releases/download/$TAG"
+          mac_arm_sig=$(find release-assets -name '*_macos_aarch64.app.tar.gz.sig' -print -quit)
+          mac_x64_sig=$(find release-assets -name '*_macos_x86_64.app.tar.gz.sig' -print -quit)
+          win_sig=$(find release-assets -name '*_windows_x86_64.exe.sig' -print -quit)
+          test -n "$mac_arm_sig" && test -n "$mac_x64_sig" && test -n "$win_sig"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "2xapi Codex Console $TAG" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg mac_arm_url "$base_url/$(basename "${mac_arm_sig%.sig}")" \
+            --arg mac_arm_sig "$(cat "$mac_arm_sig")" \
+            --arg mac_x64_url "$base_url/$(basename "${mac_x64_sig%.sig}")" \
+            --arg mac_x64_sig "$(cat "$mac_x64_sig")" \
+            --arg win_url "$base_url/$(basename "${win_sig%.sig}")" \
+            --arg win_sig "$(cat "$win_sig")" \
+            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-aarch64":{url:$mac_arm_url,signature:$mac_arm_sig},"darwin-x86_64":{url:$mac_x64_url,signature:$mac_x64_sig},"windows-x86_64":{url:$win_url,signature:$win_sig}}}' \
+            > release-assets/latest.json
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: false
+          files: release-assets/*

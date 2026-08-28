@@ -1,4 +1,0 @@
-# 允许修改的 workflow 文件（按相对路径）
-.github/workflows/ci.yml
-.github/workflows/release-acceptance.yml
-.github/workflows/branch-hygiene-report.yml

@@ -1,7 +1,0 @@
-dist
-node_modules
-coverage
-*.local
-*.log
-test-results
-playwright-report
