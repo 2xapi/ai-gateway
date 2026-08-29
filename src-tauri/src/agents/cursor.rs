@@ -521,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn host_writes_only_three_places_and_preserves_user_data() {
         let root = std::env::temp_dir().join(format!("2xapi-cursor-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -572,6 +573,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn host_direct_writes_real_key_with_v1_rule() {
         let root = std::env::temp_dir().join(format!("2xapi-cursor-direct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -602,6 +604,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn host_idempotent_and_unhost_restores_exactly() {
         let root = std::env::temp_dir().join(format!("2xapi-cursor-cycle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -636,6 +639,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn unhost_without_snapshot_strips_controlled_fields() {
         let root = std::env::temp_dir().join(format!("2xapi-cursor-nosnap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -660,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn unhost_preserves_later_unrelated_changes_and_restores_original_key() {
         let root =
             std::env::temp_dir().join(format!("2xapi-cursor-surgical-{}", std::process::id()));
@@ -695,6 +700,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn state_shape_and_hosted_detection() {
         let root = std::env::temp_dir().join(format!("2xapi-cursor-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -736,6 +742,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires_cursor_process_closed"]
     fn host_rejects_foreign_agent_without_db_changes() {
         let root =
             std::env::temp_dir().join(format!("2xapi-cursor-foreign-{}", std::process::id()));
