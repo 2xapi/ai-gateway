@@ -63,6 +63,7 @@ button { font-family: inherit; }
 .settings-body { min-width:0; overflow-y:auto; padding:0 2px 20px 0; }
 .usage-page { min-height:100%; display:flex; flex-direction:column; gap:14px; }
 .usage-page-body { min-width:0; }
+
 .no-bar { scrollbar-width: none; -ms-overflow-style: none; }
 .no-bar::-webkit-scrollbar { width: 0; height: 0; display: none; }
 .show-bar::-webkit-scrollbar { width: 8px; }

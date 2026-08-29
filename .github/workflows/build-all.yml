@@ -94,16 +94,24 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x86_64
+          - target: aarch64-pc-windows-msvc
+            arch: aarch64
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: windows-x86_64
+          key: windows-${{ matrix.arch }}
       - uses: taiki-e/install-action@v2
         with:
           tool: tauri-cli
@@ -116,23 +124,23 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        run: cargo tauri build --target ${{ matrix.target }} --bundles nsis
       - name: Normalize release assets
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          $root = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          $root = "src-tauri/target/${{ matrix.target }}/release/bundle"
           New-Item -ItemType Directory -Force release-assets | Out-Null
           # 只发布 standalone EXE 安装器(不做增量 zip 与 MSI,减少发布面)
           $exeSig = Get-ChildItem "$root/nsis" -Filter "*.exe.sig" | Select-Object -First 1
           if (-not $exeSig) { throw "Windows installer signature not found" }
           $exeUpdater = $exeSig.FullName.Substring(0, $exeSig.FullName.Length - 4)
-          $name = "2xapi-codex-console_${version}_windows_x86_64.exe"
+          $name = "2xapi-codex-console_${version}_windows_${{ matrix.arch }}.exe"
           Copy-Item $exeUpdater "release-assets/$name"
           Copy-Item $exeSig.FullName "release-assets/$name.sig"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-windows-x86_64
+          name: release-windows-${{ matrix.arch }}
           path: release-assets/*
           if-no-files-found: error
 
