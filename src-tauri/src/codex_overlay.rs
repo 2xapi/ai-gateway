@@ -84,7 +84,7 @@ pub fn capture_fields(path: &Path) -> Result<BTreeMap<String, OverlayField>, Str
     } else {
         DocumentMut::new()
     };
-    for key in ["model_provider", "model", "model_catalog_json"] {
+    for key in ["model_provider", "model", "model_catalog_json", "openai_base_url"] {
         fields.insert(key.into(), top_level_field(&doc, key));
     }
     fields.insert(
@@ -256,7 +256,7 @@ pub fn restore_owned_fields(
         DocumentMut::new()
     };
     let mut conflicts = Vec::new();
-    for key in ["model_provider", "model", "model_catalog_json"] {
+    for key in ["model_provider", "model", "model_catalog_json", "openai_base_url"] {
         let Some(applied) = state.applied.get(key) else {
             continue;
         };
@@ -394,6 +394,10 @@ pub fn apply_gateway(
         doc["model"] = value(model);
     }
     doc["model_catalog_json"] = value(catalog_path);
+    // 官方 provider 的流量也引入网关(Codex++ 同款 openai_base_url 招法):
+    // 旧会话按线程钉死 provider=openai,不指进来就会直连官方后端、撞官方套餐限额;
+    // 进网关后由激活供应商转发,旧会话与官方登录并存。
+    doc["openai_base_url"] = value(base_url);
     ensure_provider(&mut doc, base_url, official_auth);
     write_atomic(path, doc.to_string().as_bytes(), Some(&before))?;
     fingerprint(path)

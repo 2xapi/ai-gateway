@@ -625,6 +625,15 @@ pub fn unhost(
                 obj.remove("model_catalog_json");
                 // 托管写入的模型名(如 gpt-5.6-sol)在官方后端不存在,一并清掉回默认
                 obj.remove("model");
+                // 官方通道引入行:仅清指向本机网关的;用户自有的 openai_base_url 保留
+                let owned_official_base = obj
+                    .get("openai_base_url")
+                    .and_then(|v| v.as_str())
+                    .map(|url| url.contains(GATEWAY_ADDR))
+                    .unwrap_or(false);
+                if owned_official_base {
+                    obj.remove("openai_base_url");
+                }
             }
             let before = std::fs::read_to_string(config_path).unwrap_or_default();
             let after = crate::config::config_to_toml_string(&current).map_err(io)?;
@@ -950,6 +959,11 @@ mod tests {
         // 用户字段保留 + catalog 指向
         assert!(written.contains("my_custom_setting"));
         assert!(written.contains("model_catalog_json"));
+        // 官方通道引入网关:旧线程(provider=openai)不再直连官方后端撞套餐限额
+        assert!(
+            written.contains("openai_base_url = \"http://127.0.0.1:8787\""),
+            "应写 openai_base_url 指向网关:\n{written}"
+        );
         // catalog 文件与 active
         assert!(home.join(MODEL_CATALOG_FILENAME).exists());
         assert_eq!(
@@ -1492,6 +1506,55 @@ mod tests {
         let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
         assert!(!auth.contains("sk-test-secret"), "托管 key 必须让位: {auth}");
         assert!(auth.contains("\"official\""), "官方 tokens 必须保留: {auth}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// openai_base_url:托管引入、停用还原;legacy 停用只清指向本机网关的,用户自有地址保留。
+    #[test]
+    fn openai_base_url_managed_across_host_unhost() {
+        let (root, cfg, bk, home, prov) = sandbox("obu-cycle");
+        // host 前用户已有自己的 openai_base_url → 停用后必须原样恢复
+        std::fs::write(
+            &cfg,
+            "openai_base_url = \"https://user-openai.example/v1\"\n",
+        )
+        .unwrap();
+        write_providers(&prov, vec![provider("p1", "A")]);
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        let hosted = std::fs::read_to_string(&cfg).unwrap();
+        assert!(hosted.contains("openai_base_url = \"http://127.0.0.1:8787\""));
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let restored = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            restored.contains("https://user-openai.example/v1"),
+            "用户自有 openai_base_url 必须恢复:\n{restored}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_unhost_keeps_foreign_openai_base_url() {
+        let (root, cfg, bk, home, prov) = sandbox("obu-legacy");
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\nopenai_base_url = \"https://user-openai.example/v1\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://2xa.example.com\"\nexperimental_bearer_token = \"k\"\n",
+        )
+        .unwrap();
+        let mut data = ProviderData {
+            schema_version: 1,
+            active_provider_id: None,
+            active_provider_ids: Default::default(),
+            providers: vec![provider("p1", "A")],
+        };
+        data.active_provider_ids
+            .insert("codex".into(), "p1".into());
+        std::fs::write(&prov, serde_json::to_string(&data).unwrap()).unwrap();
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            written.contains("https://user-openai.example/v1"),
+            "非网关地址不得误删:\n{written}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
