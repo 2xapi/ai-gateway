@@ -523,7 +523,9 @@ pub fn unhost(
             .get("model_provider")
             .and_then(|value| value.as_str())
             == Some(crate::codex_overlay::PROVIDER_ID);
-        let (config_written, conflicts) = if new_provider {
+        // 2026-08-31 简化:detect_hosting 非空 = 已确权,托管中就一定能停。
+        // 新独占 overlay 按 sidecar 精确还原托管前字段;旧版 custom 形态(直连/网关)直接回官方默认。
+        let (config_written, conflicts, auth_restored) = if new_provider {
             let result =
                 crate::codex_overlay::restore_owned_fields(config_path, &overlay_path, None)
                     .map_err(io)?;
@@ -536,24 +538,52 @@ pub fn unhost(
                         .collect()
                 })
                 .unwrap_or_default();
-            (result["changed"].as_bool().unwrap_or(false), conflicts)
+            (result["changed"].as_bool().unwrap_or(false), conflicts, false)
         } else {
-            return Err((
-                409,
-                "E_OVERLAY_STATE_MISSING".into(),
-                "检测到旧版或外部 Codex 路由，但没有 2xapi ownership sidecar；请先使用官方默认恢复预览，不会自动删除 custom 配置".into(),
-            ));
+            let mut current = read_toml(config_path);
+            if let Some(mp) = current.get_mut("model_providers").and_then(|v| v.as_object_mut()) {
+                mp.remove("custom");
+                mp.remove(crate::codex_overlay::PROVIDER_ID);
+            }
+            if let Some(obj) = current.as_object_mut() {
+                obj.insert("model_provider".into(), json!("openai"));
+                obj.remove("model_catalog_json");
+                // 托管写入的模型名(如 gpt-5.6-sol)在官方后端不存在,一并清掉回默认
+                obj.remove("model");
+            }
+            let before = std::fs::read_to_string(config_path).unwrap_or_default();
+            let after = crate::config::config_to_toml_string(&current).map_err(io)?;
+            let changed = before != after;
+            if changed {
+                // 与 config::write_toml(仅 cfg(test)) 等价的原子写:临时文件→rename,权限 0600
+                crate::config::write_private_atomic(
+                    config_path,
+                    after.as_bytes(),
+                    "toml.tmp",
+                    "config.toml",
+                )
+                .map_err(io)?;
+            }
+            // PureApi 遗留:key 曾写进 auth.json,有官方备份则还原;旧 Mixed 的 key 在 config 段里,随段删除
+            let mut auth_restored = false;
+            let auth_bak = codex_home.join("auth.json.official.bak");
+            if auth_bak.exists() {
+                if let Ok(data) = std::fs::read(&auth_bak) {
+                    crate::config::write_private_atomic(
+                        &codex_home.join("auth.json"),
+                        &data,
+                        "unhost.tmp",
+                        "停用还原官方 auth",
+                    )
+                    .map_err(io)?;
+                    auth_restored = true;
+                }
+            }
+            (changed, vec![], auth_restored)
         };
-        let catalog_owned = crate::codex_overlay::read_overlay_state(&overlay_path)
-            .map_err(io)?
-            .and_then(|state| state.catalog)
-            .and_then(|expected| {
-                crate::codex_overlay::fingerprint(&catalog_path)
-                    .ok()
-                    .map(|actual| expected.sha256 == actual.sha256)
-            })
-            .unwrap_or(false);
-        if catalog_owned && catalog_path.exists() {
+        // catalog 文件是 Console 专有命名,停用即移除
+        let catalog_removed = catalog_path.exists();
+        if catalog_removed {
             std::fs::remove_file(&catalog_path).map_err(|e| io(e.to_string()))?;
         }
         if overlay_path.exists() {
@@ -564,7 +594,7 @@ pub fn unhost(
         Ok(json!({
             "restored": true, "way": "clean",
             "conflicts": conflicts,
-            "changed": { "config": config_written, "catalog": catalog_owned, "auth": false },
+            "changed": { "config": config_written, "catalog": catalog_removed, "auth": auth_restored },
         }))
     })();
     outcome.map_err(|error| rollback_files(error, &snapshots))
@@ -1242,6 +1272,80 @@ mod tests {
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         unhost(&cfg, &bk, &home, &prov).unwrap();
         assert!(!home.join("auth.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 2026-08-31 简化:旧版 custom 直连托管(bearer + active provider,detect_hosting 判 direct)
+    /// 停用不再 409 死路,直接回官方默认:删 custom 段/bearer/托管模型/catalog。
+    #[test]
+    fn unhost_legacy_custom_direct_restores_official() {
+        let (root, cfg, bk, home, prov) = sandbox("unhost-legacy-direct");
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_catalog_json = \"catalog\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://2xa.example.com\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nexperimental_bearer_token = \"sk-legacy\"\n",
+        )
+        .unwrap();
+        std::fs::write(home.join(MODEL_CATALOG_FILENAME), "{}\n").unwrap();
+        let mut data = ProviderData {
+            schema_version: 1,
+            active_provider_id: None,
+            active_provider_ids: Default::default(),
+            providers: vec![provider("p1", "A")],
+        };
+        data.active_provider_ids
+            .insert("codex".into(), "p1".into());
+        std::fs::write(&prov, serde_json::to_string(&data).unwrap()).unwrap();
+
+        let out = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert!(out["restored"].as_bool().unwrap(), "旧版托管必须能停:\n{out}");
+        assert_eq!(out["changed"]["catalog"], json!(true));
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("model_provider = \"openai\""), "{written}");
+        assert!(!written.contains("[model_providers.custom]"));
+        assert!(!written.contains("experimental_bearer_token"));
+        assert!(!written.contains("model ="));
+        assert!(!written.contains("model_catalog_json"));
+        assert!(!home.join(MODEL_CATALOG_FILENAME).exists());
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prov).unwrap()).unwrap();
+        assert!(data["active_provider_ids"]["codex"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 旧版 PureApi 直连:auth.json 被写入过 key,停用时存在官方备份则还原。
+    #[test]
+    fn unhost_legacy_pureapi_restores_auth_backup() {
+        let (root, cfg, bk, home, prov) = sandbox("unhost-legacy-auth");
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://2xa.example.com\"\nexperimental_bearer_token = \"\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-written-by-console"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("auth.json.official.bak"),
+            r#"{"tokens":{"id_token":"OFFICIAL"}}"#,
+        )
+        .unwrap();
+        let mut data = ProviderData {
+            schema_version: 1,
+            active_provider_id: None,
+            active_provider_ids: Default::default(),
+            providers: vec![provider("p1", "A")],
+        };
+        data.active_provider_ids
+            .insert("codex".into(), "p1".into());
+        std::fs::write(&prov, serde_json::to_string(&data).unwrap()).unwrap();
+
+        let out = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert_eq!(out["changed"]["auth"], json!(true));
+        assert!(std::fs::read_to_string(home.join("auth.json"))
+            .unwrap()
+            .contains("OFFICIAL"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

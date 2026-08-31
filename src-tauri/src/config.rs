@@ -27,7 +27,7 @@ pub(crate) const AUTH_OFFICIAL_BAK: &str = "auth.json.official.bak";
 
 // ── TOML 读写（JSON Value ↔ TOML，原子写）────────────────────
 
-fn write_private_atomic(
+pub(crate) fn write_private_atomic(
     path: &Path,
     data: &[u8],
     tmp_extension: &str,
