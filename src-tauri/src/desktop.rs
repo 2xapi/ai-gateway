@@ -344,7 +344,33 @@ pub fn host(
             let catalog_missing = !catalog_path.exists();
             let provider_differs = current.get("model_provider").and_then(|v| v.as_str())
                 != Some(crate::codex_overlay::PROVIDER_ID);
-            if (model_differs || catalog_missing || provider_differs) && !provider.model.is_empty()
+            // 2026-08-31：catalog 内容过期也必须重写——否则存量托管客户(模型未变)永远拿不到
+            // 修复后的能力声明(如 input_modalities 补 image)，图片输入会一直被 Codex 拦截。
+            let catalog_models: Vec<crate::providers::ModelConfig> =
+                if provider.models.is_empty() {
+                    vec![crate::providers::ModelConfig {
+                        name: provider.model.clone(),
+                        display_name: None,
+                        context_window: None,
+                        is_multimodal: false,
+                        send_as_is: false,
+                    }]
+                } else {
+                    provider.models.clone()
+                };
+            let catalog_raw = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&build_model_catalog(
+                    &catalog_models,
+                    provider.reasoning_levels.as_deref().unwrap_or(&[]),
+                ))
+                .map_err(|e| io(e.to_string()))?
+            );
+            let catalog_stale = std::fs::read_to_string(&catalog_path)
+                .map(|existing| existing != catalog_raw)
+                .unwrap_or(true);
+            if (model_differs || catalog_missing || catalog_stale || provider_differs)
+                && !provider.model.is_empty()
             {
                 backup_file(config_path, backup_dir, "config-apply", "pre-switch").map_err(io)?;
                 let before = crate::codex_overlay::fingerprint(config_path).map_err(io)?;
@@ -358,24 +384,7 @@ pub fn host(
                 )
                 .map_err(io)?;
                 config_written = before.sha256 != after.sha256;
-                let catalog_models: Vec<crate::providers::ModelConfig> =
-                    if provider.models.is_empty() {
-                        vec![crate::providers::ModelConfig {
-                            name: provider.model.clone(),
-                            display_name: None,
-                            context_window: None,
-                            is_multimodal: false,
-                            send_as_is: false,
-                        }]
-                    } else {
-                        provider.models.clone()
-                    };
-                let catalog = build_model_catalog(
-                    &catalog_models,
-                    provider.reasoning_levels.as_deref().unwrap_or(&[]),
-                );
-                let raw = serde_json::to_string_pretty(&catalog).map_err(|e| io(e.to_string()))?;
-                std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| io(e.to_string()))?;
+                std::fs::write(&catalog_path, &catalog_raw).map_err(|e| io(e.to_string()))?;
             }
 
             crate::codex_overlay::record_applied_state(

@@ -553,19 +553,22 @@ pub(crate) fn build_model_catalog(models: &[ModelConfig], reasoning_levels: &[St
                 "display_name": disp,
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
-                "input_modalities": ["text"],
+                // 2026-08-31 产品定案：模型能力全量放开，不按 is_multimodal 收窄。
+                // 此前 ["text"] 会让 Codex 桌面端直接拦截贴图（「不支持图片输入」），
+                // 而上游实测支持图片；能力收窄交给网关按上游真实返回降级。
+                "input_modalities": ["text", "image"],
                 "max_context_window": cw,
                 "priority": 1000 + i,
                 "service_tiers": [],
                 "shell_type": "shell_command",
                 "slug": m.name,
-                "support_verbosity": false,
+                "support_verbosity": true,
                 "supported_in_api": true,
                 "supported_reasoning_levels": rl_json,
-                "supports_image_detail_original": false,
+                "supports_image_detail_original": true,
                 "supports_parallel_tool_calls": true,
                 "supports_reasoning_summaries": true,
-                "supports_search_tool": false,
+                "supports_search_tool": true,
                 "truncation_policy": { "limit": 10000, "mode": "bytes" },
                 "upgrade": Value::Null,
                 "visibility": "list"
@@ -850,6 +853,24 @@ mod tests {
             "PureApi 不应含 experimental_bearer_token:\n{written2}"
         );
         let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    /// 2026-08-31 产品定案：catalog 能力全量放开（否则 Codex 桌面端拦贴图）。
+    #[test]
+    fn catalog_capabilities_unrestricted() {
+        let models = vec![crate::providers::ModelConfig {
+            name: "gpt-5.6-sol".into(),
+            display_name: None,
+            context_window: None,
+            is_multimodal: false, // 故意 false：能力不按该字段收窄
+            send_as_is: false,
+        }];
+        let catalog = build_model_catalog(&models, &[]);
+        let m = &catalog["models"][0];
+        assert_eq!(m["input_modalities"], json!(["text", "image"]));
+        assert_eq!(m["supports_image_detail_original"], json!(true));
+        assert_eq!(m["supports_search_tool"], json!(true));
+        assert_eq!(m["support_verbosity"], json!(true));
     }
 
     /// Official：删除 custom 段 + model_provider=openai + 无 model_catalog_json。
