@@ -387,6 +387,11 @@ pub fn host(
                 std::fs::write(&catalog_path, &catalog_raw).map_err(|e| io(e.to_string()))?;
             }
 
+            // 官方 tokens 与托管 key 并存时清掉 key:auth.json 归官方登录,
+            // 否则官方 provider 会拿 2xapi key 打 api.openai.com → 401。
+            let auth_cleaned = auth_json_has_official_tokens(codex_home)
+                && strip_console_owned_auth_key(codex_home, providers_path).map_err(io)?;
+
             crate::codex_overlay::record_applied_state(
                 config_path,
                 backup_dir,
@@ -402,7 +407,7 @@ pub fn host(
                 "hasOfficial": login.state == crate::codex_security::LoginState::SignedIn,
                 "login": login,
                 "hosting": detect_hosting(config_path, providers_path),
-                "changed": { "config": config_written, "auth": false },
+                "changed": { "config": config_written, "auth": auth_cleaned },
             }))
         })();
         return outcome.map_err(|error| rollback_files(error, &snapshots));
@@ -472,6 +477,10 @@ pub fn host(
             .map_err(|e| e.to_string())
             .map_err(io)?;
 
+        // 同上:官方 tokens 在位时,auth.json 里我们写的 key 必须让位。
+        let auth_cleaned = auth_json_has_official_tokens(codex_home)
+            && strip_console_owned_auth_key(codex_home, providers_path).map_err(io)?;
+
         crate::codex_overlay::record_applied_state(
             config_path,
             backup_dir,
@@ -488,10 +497,76 @@ pub fn host(
             "hasOfficial": login.state == crate::codex_security::LoginState::SignedIn,
             "login": login,
             "hosting": detect_hosting(config_path, providers_path),
-            "changed": { "config": config_written, "auth": false, "authBackup": false },
+            "changed": { "config": config_written, "auth": auth_cleaned, "authBackup": false },
         }))
     })();
     outcome.map_err(|error| rollback_files(error, &snapshots))
+}
+
+// ── auth.json 归官方登录(Codex++ 同款铁律)──────────────────────
+
+/// auth.json 里 OPENAI_API_KEY 与 providers.json 任一供应商 key 相同,即视为本软件
+/// 历史 PureApi 流程写入的托管 key——移除之;官方 tokens 等其他字段原样保留。
+/// 第三方/用户自有 key(如 opencode)不匹配则不动。返回是否发生改写。
+pub(crate) fn strip_console_owned_auth_key(
+    codex_home: &Path,
+    providers_path: &Path,
+) -> Result<bool, String> {
+    let auth_path = codex_home.join("auth.json");
+    let raw = match std::fs::read_to_string(&auth_path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(false),
+    };
+    let mut value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let key = value
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if key.is_empty() {
+        return Ok(false);
+    }
+    let owned = crate::providers::load(providers_path)
+        .providers
+        .iter()
+        .any(|p| !p.api_key.trim().is_empty() && p.api_key.trim() == key);
+    if !owned {
+        return Ok(false);
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("OPENAI_API_KEY");
+    }
+    let cleaned = format!("{}\n", serde_json::to_string_pretty(&value).unwrap_or_default());
+    crate::config::write_private_atomic(
+        &auth_path,
+        cleaned.as_bytes(),
+        "auth.tmp",
+        "清理托管残留 key",
+    )?;
+    Ok(true)
+}
+
+/// `.official.bak` 是否真含官方登录(tokens 非空)。key-only 的旧备份还原回去只会
+/// 让官方 provider 拿 2xapi key 打 api.openai.com → 401,不算官方凭据。
+pub(crate) fn auth_bak_has_official_tokens(codex_home: &Path) -> bool {
+    auth_contents_have_official_tokens(&std::fs::read_to_string(codex_home.join("auth.json.official.bak")).unwrap_or_default())
+}
+
+/// auth.json 当前是否带官方登录 tokens(非空 tokens 对象)。
+pub(crate) fn auth_json_has_official_tokens(codex_home: &Path) -> bool {
+    auth_contents_have_official_tokens(&std::fs::read_to_string(codex_home.join("auth.json")).unwrap_or_default())
+}
+
+fn auth_contents_have_official_tokens(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("tokens").cloned())
+        .map(|t| t.as_object().map(|o| !o.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 // ── unhost ───────────────────────────────────────────────────
@@ -564,13 +639,16 @@ pub fn unhost(
                 )
                 .map_err(io)?;
             }
-            // PureApi 遗留:key 曾写进 auth.json,有官方备份则还原;旧 Mixed 的 key 在 config 段里,随段删除
+            // auth.json 归官方登录:备份里真有官方 tokens 才还原;key-only 备份还原回去
+            // 只会让官方 provider 拿 2xapi key 打 api.openai.com。残留的托管 key 则清掉
+            // (仅限 providers.json 能认领的;第三方 key 不动)。
             let mut auth_restored = false;
-            let auth_bak = codex_home.join("auth.json.official.bak");
-            if auth_bak.exists() {
-                if let Ok(data) = std::fs::read(&auth_bak) {
+            if auth_bak_has_official_tokens(codex_home) {
+                if let Ok(data) = std::fs::read(codex_home.join("auth.json.official.bak")) {
+                    let auth_path = codex_home.join("auth.json");
+                    let _ = backup_file(&auth_path, backup_dir, "auth-apply", "pre-unhost-auth");
                     crate::config::write_private_atomic(
-                        &codex_home.join("auth.json"),
+                        &auth_path,
                         &data,
                         "unhost.tmp",
                         "停用还原官方 auth",
@@ -578,6 +656,8 @@ pub fn unhost(
                     .map_err(io)?;
                     auth_restored = true;
                 }
+            } else if strip_console_owned_auth_key(codex_home, providers_path).map_err(io)? {
+                auth_restored = true;
             }
             (changed, vec![], auth_restored)
         };
@@ -1346,6 +1426,89 @@ mod tests {
         assert!(std::fs::read_to_string(home.join("auth.json"))
             .unwrap()
             .contains("OFFICIAL"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// key-only 的 .official.bak 不还原(还原=官方 provider 拿 2xapi key 打官方后端);
+    /// auth.json 里我们写的 key 清掉,第三方 key 保留。
+    #[test]
+    fn unhost_legacy_keyonly_bak_strips_owned_key_only() {
+        let (root, cfg, bk, home, prov) = sandbox("unhost-keyonly-bak");
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://2xa.example.com\"\nexperimental_bearer_token = \"x\"\n",
+        )
+        .unwrap();
+        // 我们写的 key(= provider p1 的 sk-test-secret)+ 第三方 key 场景用第二个 provider
+        std::fs::write(
+            &prov,
+            serde_json::to_string(&ProviderData {
+                schema_version: 1,
+                active_provider_id: None,
+                active_provider_ids: [("codex".to_string(), "p1".to_string())].into_iter().collect(),
+                providers: vec![
+                    provider("p1", "A"),
+                    Provider { id: "p2".into(), name: "B".into(), api_key: "sk-vendor".into(), ..provider("p2", "B") },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-test-secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("auth.json.official.bak"),
+            r#"{"OPENAI_API_KEY":"sk-ancient"}"#,
+        )
+        .unwrap();
+
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(!auth.contains("sk-test-secret"), "我们的 key 必须清掉: {auth}");
+        assert!(!auth.contains("OPENAI_API_KEY"), "key-only 无 tokens,清完应只剩空对象: {auth}");
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json.official.bak")).unwrap(),
+            r#"{"OPENAI_API_KEY":"sk-ancient"}"#,
+            "key-only 备份保持原样,不回灌"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 官方 tokens 在位时开托管:auth.json 里我们写的 key 让位,tokens 原样保留(保持官方登入)。
+    #[test]
+    fn host_strips_owned_key_when_official_tokens_present() {
+        let (root, cfg, bk, home, prov) = sandbox("host-strip-key");
+        write_providers(&prov, vec![provider("p1", "A")]);
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-test-secret","auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#,
+        )
+        .unwrap();
+        let out = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        assert_eq!(out["changed"]["auth"], json!(true));
+        let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(!auth.contains("sk-test-secret"), "托管 key 必须让位: {auth}");
+        assert!(auth.contains("\"official\""), "官方 tokens 必须保留: {auth}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 第三方 key(opencode 等)不属于我们,托管/停用都不动。
+    #[test]
+    fn strip_never_touches_vendor_key() {
+        let (root, _cfg, _bk, home, prov) = sandbox("strip-vendor");
+        write_providers(&prov, vec![provider("p1", "A")]);
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-other-vendor"}"#,
+        )
+        .unwrap();
+        assert!(!strip_console_owned_auth_key(&home, &prov).unwrap());
+        assert!(std::fs::read_to_string(home.join("auth.json"))
+            .unwrap()
+            .contains("sk-other-vendor"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
