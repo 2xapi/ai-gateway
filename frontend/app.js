@@ -2786,15 +2786,29 @@ async function doAccel(m) {
 }
 
 /* ── 登录(2xapi 账号:邮箱/密码 + 记住我;站点开启验证码时弹滑块)── */
-var captchaCfg = { enabled: false, appId: "", loaded: false, loading: false, waiters: [] };
-function loadTcaptchaJs(cb) {
+/* 验证码区域与 2xapi 网页端对齐(settings/public: tencent_captcha_region cn|intl):
+   cn 加载 TJCaptcha.js( appId, cb, opts );intl 加载 TJNCaptcha-global.js( 容器DOM, appId, cb, opts )。
+   两版回调同构 {ret,ticket,randstr},登录字段名不变(tencent_captcha_ticket/randstr)。 */
+var TCAPTCHA_JS = {
+  cn: "https://turing.captcha.qcloud.com/TJCaptcha.js",
+  intl: "https://ca.turing.captcha.qcloud.com/TJNCaptcha-global.js",
+};
+var captchaCfg = { enabled: false, appId: "", region: "cn", loadedUrl: "", loaded: false, loading: false, waiters: [] };
+function tcaptchaJsUrl(region) { return TCAPTCHA_JS[region] || TCAPTCHA_JS.cn; }
+function loadTcaptchaJs(region, cb) {
   cb = typeof cb === "function" ? cb : function () {};
-  if (window.TencentCaptcha) { captchaCfg.loaded = true; cb(); return; }
+  var url = tcaptchaJsUrl(region);
+  if (window.TencentCaptcha && captchaCfg.loadedUrl) {
+    if (captchaCfg.loadedUrl === url) { captchaCfg.loaded = true; cb(null); return; }
+    cb(new Error("验证码区域已变更,请关闭并重新打开登录窗口"));
+    return;
+  }
   captchaCfg.waiters.push(cb);
   if (captchaCfg.loading) return;
   captchaCfg.loading = true;
+  captchaCfg.loadedUrl = url;
   var s = document.createElement("script");
-  s.src = "https://turing.captcha.qcloud.com/TCaptcha.js";
+  s.src = url;
   s.onload = function () {
     captchaCfg.loaded = !!window.TencentCaptcha;
     captchaCfg.loading = false;
@@ -2804,6 +2818,7 @@ function loadTcaptchaJs(cb) {
   s.onerror = function () {
     captchaCfg.loaded = false;
     captchaCfg.loading = false;
+    captchaCfg.loadedUrl = "";
     var error = new Error("验证码组件加载失败,请检查网络");
     var waiters = captchaCfg.waiters.splice(0);
     waiters.forEach(function (waiter) { waiter(error); });
@@ -2870,7 +2885,8 @@ function openLogin() {
     if (loginSeq !== state.loginRequestSeq) return;
     captchaCfg.enabled = !!(c && c.enabled);
     captchaCfg.appId = (c && String(c.appId || "")) || "";
-    if (captchaCfg.enabled && state.loginPhase === "idle") { loadTcaptchaJs(function () {}); renderLoginForm(); }
+    captchaCfg.region = (c && String(c.region || "cn")) || "cn";
+    if (captchaCfg.enabled && state.loginPhase === "idle") { loadTcaptchaJs(captchaCfg.region, function () {}); renderLoginForm(); }
   }).catch(function () {});
 }
 async function doLogin() {
@@ -2920,39 +2936,44 @@ async function doLogin() {
     state.loginBusy = true;
     state.loginPhase = "captcha";
     renderLoginForm();
-    loadTcaptchaJs(function () {
+    loadTcaptchaJs(captchaCfg.region, function () {
       if (loginSeq !== state.loginRequestSeq) return;
-      if (arguments[0]) {
+      var fail = function (message) {
         state.loginBusy = false;
         state.loginPhase = "idle";
-        state.loginError = arguments[0].message;
+        state.loginError = message;
         renderLoginForm();
-        return;
-      }
-      if (!window.TencentCaptcha) {
-        state.loginBusy = false;
-        state.loginPhase = "idle";
-        state.loginError = "验证码组件未就绪,请重试";
-        renderLoginForm();
-        return;
-      }
+      };
+      if (arguments[0]) { fail(arguments[0].message); return; }
+      if (!window.TencentCaptcha) { fail("验证码组件未就绪,请重试"); return; }
+      var isIntl = captchaCfg.region === "intl";
+      var container = isIntl ? document.getElementById("tcaptchaIntlBox") : null;
+      if (isIntl && !container) { fail("验证码容器缺失,请重试"); return; }
       try {
-        var cap = new window.TencentCaptcha(captchaCfg.appId, function (res) {
+        var onResult = function (res) {
           if (loginSeq !== state.loginRequestSeq) return;
-          if (res && res.ret === 0) submit(res.ticket, res.randstr);
-          else {
+          if (res && res.ret === 2) { /* 用户关闭验证码,回到待登录 */
             state.loginBusy = false;
             state.loginPhase = "idle";
             renderLoginForm();
+            return;
           }
-        });
+          var ticket = String((res && res.ticket) || "").trim();
+          var randstr = String((res && res.randstr) || "").trim();
+          /* 与 2xapi 网页端同判:票据为空/trerror_ 前缀/带 errorCode 都是校验失败 */
+          if (!ticket || !randstr || ticket.indexOf("trerror_") === 0 || (res && res.errorCode !== undefined)) {
+            fail("验证码校验未通过,请重试");
+            return;
+          }
+          submit(ticket, randstr);
+        };
+        var cap = isIntl
+          ? new window.TencentCaptcha(container, captchaCfg.appId, onResult, { enableAutoCheck: false, userLanguage: "zh-cn", type: "popup" })
+          : new window.TencentCaptcha(captchaCfg.appId, onResult, { userLanguage: "zh-cn" });
         cap.show();
       } catch (error) {
         if (loginSeq !== state.loginRequestSeq) return;
-        state.loginBusy = false;
-        state.loginPhase = "idle";
-        state.loginError = error.message || "验证码组件启动失败,请重试";
-        renderLoginForm();
+        fail(error.message || "验证码组件启动失败,请重试");
       }
     });
   } else {

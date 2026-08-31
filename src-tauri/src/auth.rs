@@ -259,8 +259,8 @@ async fn xapi_request(
     Err(last_err)
 }
 
-/// 验证码设置(Sub2API settings/public 为扁平字段:tencent_captcha_enabled / tencent_captcha_app_id)。
-/// 旧实现按嵌套 captcha 段读,恒得 enabled=false —— 已按 Sub2API 实际结构修正。
+/// 验证码设置(Sub2API settings/public 为扁平字段:tencent_captcha_enabled / tencent_captcha_app_id /
+/// tencent_captcha_region)。旧实现按嵌套 captcha 段读,恒得 enabled=false —— 已按 Sub2API 实际结构修正。
 pub async fn fetch_captcha_settings() -> Result<Value, String> {
     let result = xapi_request(
         "/settings/public?timezone=UTC",
@@ -269,7 +269,13 @@ pub async fn fetch_captcha_settings() -> Result<Value, String> {
         "",
     )
     .await?;
-    let d = result.get("data").unwrap_or(&result);
+    Ok(captcha_settings_from_public(&result))
+}
+
+/// region=intl 表示站点启用腾讯云国际版验证码:前端须加载 TJNCaptcha-global.js(容器式构造器),
+/// 服务端改用 captcha.intl.tencentcloudapi.com 核验票据;登录字段名不变(tencent_captcha_ticket/randstr)。
+pub(crate) fn captcha_settings_from_public(result: &Value) -> Value {
+    let d = result.get("data").unwrap_or(result);
     let app_id = d
         .get("tencent_captcha_app_id")
         .map(|v| match v {
@@ -278,10 +284,16 @@ pub async fn fetch_captcha_settings() -> Result<Value, String> {
             _ => String::new(),
         })
         .unwrap_or_default();
-    Ok(json!({
+    let region = d
+        .get("tencent_captcha_region")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cn")
+        .to_string();
+    json!({
         "enabled": d.get("tencent_captcha_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
         "appId": app_id,
-    }))
+        "region": region,
+    })
 }
 
 pub async fn login(
@@ -388,6 +400,32 @@ pub async fn fetch_me(access_token: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captcha_settings_parse_region_and_defaults() {
+        // 站点开启国际版:tencent_captcha_region=intl 必须透传给前端切换 SDK
+        let intl = captcha_settings_from_public(&json!({
+            "data": {
+                "tencent_captcha_enabled": true,
+                "tencent_captcha_app_id": 189981080,
+                "tencent_captcha_region": "intl"
+            }
+        }));
+        assert_eq!(intl["enabled"], json!(true));
+        assert_eq!(intl["appId"], json!("189981080"));
+        assert_eq!(intl["region"], json!("intl"));
+
+        // 旧版站点无 region 字段:默认 cn(国内版 SDK)
+        let legacy = captcha_settings_from_public(&json!({
+            "data": { "tencent_captcha_enabled": true, "tencent_captcha_app_id": "123" }
+        }));
+        assert_eq!(legacy["region"], json!("cn"));
+
+        // 字段缺失:enabled=false 兜底
+        let empty = captcha_settings_from_public(&json!({ "data": {} }));
+        assert_eq!(empty["enabled"], json!(false));
+        assert_eq!(empty["region"], json!("cn"));
+    }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

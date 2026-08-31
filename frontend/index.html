@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'" />
 <title>2xapi Codex Console</title>
 <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="./styles.css" />
@@ -126,6 +126,8 @@
     <h3 style="margin:0 0 4px">登录 2xapi 账号</h3>
     <div class="sub">登录后可一键导入你的 Key,自动生成供应商。</div>
     <div id="loginForm"></div>
+    <!-- 腾讯云国际版验证码容器(TJNCaptcha-global.js 构造器首位必须是已挂载的 DOM) -->
+    <div id="tcaptchaIntlBox"></div>
     <div class="btn-row" style="margin-top:10px"><button class="btn primary" id="loginSubmit" data-a="do-login">登录</button><button class="btn ghost" id="loginCancel" data-a="login-close">取消</button></div>
   </div>
 </div>
