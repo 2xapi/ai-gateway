@@ -52,8 +52,47 @@ use crate::server::AppState;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 请求体上限(50MB,防超大请求拖垮本地网关)。
 const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
+/// 解压后请求体上限(与 sub2api 的 maxDecompressedBodySize 对齐,防解压炸弹)。
+const MAX_DECOMPRESSED_BODY_BYTES: usize = 64 << 20;
 /// 流式响应单 chunk 读超时:SSE 长会话不走总超时(120s 必截断),只要求每块有进展。
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 60;
+
+/// 解压客户端压缩的请求体(Codex 新版对大请求体启用 zstd/gzip 压缩,小请求不压)。
+/// 网关转发是按字段重组请求、不透传原始头,若不解压,压缩字节会以"无 Content-Encoding"
+/// 的身份发给上游、按 JSON 解析必然失败——旧会话 "Failed to parse request body" 的根因。
+/// 入口解压后以明文转发,任何上游可收(CodexPlusPlus 本地代理同款处理;sub2api 服务端亦支持)。
+fn decode_request_body(
+    encoding: Option<&axum::http::header::HeaderValue>,
+    body: axum::body::Bytes,
+) -> Result<axum::body::Bytes, String> {
+    use std::io::Read;
+    fn read_capped<R: Read>(reader: R) -> Result<Vec<u8>, String> {
+        let mut limited = reader.take((MAX_DECOMPRESSED_BODY_BYTES + 1) as u64);
+        let mut out = Vec::new();
+        limited
+            .read_to_end(&mut out)
+            .map_err(|e| format!("解压请求体失败: {e}"))?;
+        if out.len() > MAX_DECOMPRESSED_BODY_BYTES {
+            return Err("解压后的请求体超过 64MB 上限".into());
+        }
+        Ok(out)
+    }
+    let Some(raw) = encoding else { return Ok(body) };
+    let enc = raw.to_str().unwrap_or("").trim().to_ascii_lowercase();
+    if enc.is_empty() || enc == "identity" {
+        return Ok(body);
+    }
+    let decoded = match enc.as_str() {
+        "gzip" | "x-gzip" => read_capped(flate2::read::GzDecoder::new(&body[..]))?,
+        "deflate" => read_capped(flate2::read::ZlibDecoder::new(&body[..]))?,
+        "zstd" => read_capped(
+            zstd::stream::read::Decoder::new(&body[..])
+                .map_err(|e| format!("创建 zstd 解码器失败: {e}"))?,
+        )?,
+        other => return Err(format!("不支持的 Content-Encoding: {other}")),
+    };
+    Ok(decoded.into())
+}
 
 pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch(&s, req, "responses", "codex").await
@@ -113,6 +152,14 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
+    };
+    // 压缩请求体入口解压(见 decode_request_body 注释)
+    let body_bytes = match decode_request_body(
+        parts.headers.get(axum::http::header::CONTENT_ENCODING),
+        body_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
     };
     let base = provider.base_url.trim_end_matches('/');
     let target = if base.ends_with("/v1") {
@@ -452,6 +499,14 @@ async fn dispatch_anthropic_for(
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
+    // 压缩请求体入口解压(见 decode_request_body 注释)
+    let body_bytes = match decode_request_body(
+        parts.headers.get(axum::http::header::CONTENT_ENCODING),
+        body_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
+    };
     let body_bytes = rewrite_anthropic_request_model(agent, &provider, body_bytes);
     let request_stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
@@ -735,10 +790,18 @@ async fn dispatch_gemini(
         );
     }
 
-    let (_parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
+    };
+    // 压缩请求体入口解压(见 decode_request_body 注释)
+    let body_bytes = match decode_request_body(
+        parts.headers.get(axum::http::header::CONTENT_ENCODING),
+        body_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
     };
 
     let usage_started = std::time::Instant::now();
@@ -1131,6 +1194,14 @@ async fn dispatch(
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
+    // 压缩请求体入口解压(见 decode_request_body 注释)
+    let body_bytes = match decode_request_body(
+        parts.headers.get(axum::http::header::CONTENT_ENCODING),
+        body_bytes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e),
+    };
 
     let _usage_started = std::time::Instant::now();
 
@@ -1480,6 +1551,57 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 压缩请求体入口解压(zstd/gzip/identity/不支持编码)——Codex 新版大请求体走压缩,
+    /// 头不随体转发就是旧会话 "Failed to parse request body" 的根因。
+    #[test]
+    fn decode_request_body_handles_codex_encodings() {
+        let plain = br#"{"model":"gpt-5.6-sol","input":[]}"#;
+        // identity/无头:原样
+        assert_eq!(
+            decode_request_body(None, axum::body::Bytes::from_static(plain)).unwrap(),
+            axum::body::Bytes::from_static(plain)
+        );
+        let identity = axum::http::header::HeaderValue::from_static("identity");
+        assert_eq!(
+            decode_request_body(Some(&identity), axum::body::Bytes::from_static(plain)).unwrap(),
+            axum::body::Bytes::from_static(plain)
+        );
+        // gzip
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        gz.write_all(plain).unwrap();
+        let gz = gz.finish().unwrap();
+        let header = |v: &str| axum::http::header::HeaderValue::from_str(v).unwrap();
+        assert_eq!(
+            decode_request_body(Some(&header("gzip")), gz.clone().into())
+                .unwrap()
+                .as_ref(),
+            plain
+        );
+        // zstd(Codex 新版实际使用的编码)
+        let zst = zstd::encode_all(&plain[..], 3).unwrap();
+        assert_eq!(
+            decode_request_body(Some(&header("zstd")), zst.into())
+                .unwrap()
+                .as_ref(),
+            plain
+        );
+        // 大小写不敏感
+        let zst2 = zstd::encode_all(&plain[..], 3).unwrap();
+        assert_eq!(
+            decode_request_body(Some(&header("ZSTD")), zst2.into())
+                .unwrap()
+                .as_ref(),
+            plain
+        );
+        // 不支持的编码:明确报错
+        assert!(decode_request_body(Some(&header("br")), axum::body::Bytes::from_static(plain))
+            .is_err());
+        // 坏数据:解压失败报错而非 panic
+        assert!(decode_request_body(Some(&header("gzip")), axum::body::Bytes::from_static(b"not-gzip"))
+            .is_err());
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
