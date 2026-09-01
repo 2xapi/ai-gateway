@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod server;
+mod site_login;
 // M8:launcher 模块根为 launcher/mod.rs。显式 #[path] 是为了兼容旧 launcher.rs
 // 还未删除的过渡期(rustc 见到两者并存会报 ambiguous);删除旧文件后此写法同样有效。
 mod acclines;
@@ -499,6 +500,7 @@ fn main() {
         .setup(move |app| {
             updater::init(app.handle().clone()).map_err(std::io::Error::other)?;
             usage_overlay::register_app_handle(app.handle().clone());
+            crate::site_login::init(app.handle().clone());
             app.manage(state_for_app);
 
             // 界面走 Tauri 资产协议(macOS: use_https_scheme → https://localhost;

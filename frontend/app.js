@@ -2855,6 +2855,8 @@ function renderLoginForm() {
     '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail) + '"' + (state.loginBusy ? " disabled" : "") + '></div>'
     + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword) + '"' + (state.loginBusy ? " disabled" : "") + '></div>'
     + (captchaCfg.enabled ? '<div class="sub" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
+    + '<button type="button" class="btn ghost" data-a="login-site" style="width:100%;margin:2px 0 8px">🌐 在官网页登录（推荐，验证码最稳）</button>'
+    + '<div class="sub" style="margin:0 0 6px">弹出的官网窗口里登录，成功后自动返回本应用</div>'
     + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember"' + (state.loginRememberChoice ? " checked" : "") + (state.loginBusy ? " disabled" : "") + '>记住我(保持登录,滑块只需这一次)</label>'
     + (loginStatus ? '<div class="login-status" role="status" aria-live="polite"><span class="login-spinner" aria-hidden="true"></span>' + loginStatus + '</div>' : "")
     + (state.loginError ? '<div style="color:var(--c-err);font-size:12px;margin:0 0 4px">' + esc(state.loginError) + '</div>' : "");
@@ -2909,6 +2911,17 @@ function openLogin() {
     if (captchaCfg.enabled && state.loginPhase === "idle") { loadTcaptchaJs(captchaCfg.region, function () {}); renderLoginForm(); }
   }).catch(function () {});
 }
+async function doSiteLogin() {
+  /* 官网页登录:后端弹独立窗口加载 2xa.cc.cd/login(验证码在官网域名下原生运行);
+     登录态由后端回收落盘并 reload 主窗,此处只负责开窗与提示。 */
+  try {
+    await api.siteLogin();
+    showToast("已打开官网登录窗口,完成后自动返回", "ok");
+  } catch (e) {
+    showToast("打开官网登录窗口失败:" + (e.message || "未知错误"), "error");
+  }
+}
+
 async function doLogin() {
   if (state.loginBusy) return;
   var loginSeq = state.loginRequestSeq;
@@ -4305,6 +4318,7 @@ document.addEventListener("click", function (ev) {
     case "login": openLogin(); break;
     case "login-demo": openLogin(); break;
     case "do-login": doLogin(); break;
+    case "login-site": doSiteLogin(); break;
     case "login-close":
       if (state.loginPhase === "submitting" || state.loginPhase === "slow") break;
       state.loginRequestSeq++;

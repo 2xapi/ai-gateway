@@ -231,6 +231,8 @@
 
     // ── 2xapi 登录子系统（契约外，key 获取入口；这些路由是 raw 响应，不走 04 信封）──
     session: async () => rawJson("GET", "/api/session"),
+    // 内嵌官网登录窗口(验证码在官网域名下原生运行,登录态由后端回收)
+    siteLogin: () => request("POST", "/api/auth/site-login"),
     // 用系统浏览器打开外链(官网);CSP 下 window.open 不走系统浏览器,经后端 spawn
     openUrl: (url) => request("POST", "/api/open-url", { body: { url } }),
     captchaSettings: async () => rawJson("GET", "/api/auth/captcha"),

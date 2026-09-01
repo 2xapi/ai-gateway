@@ -349,6 +349,8 @@ pub fn build_router(state: AppState) -> Router {
         // --- Auth ---
         .route("/api/auth/captcha", get(handle_auth_captcha))
         .route("/api/auth/login", post(handle_auth_login))
+        // 内嵌官网登录窗口(验证码在官网域名下原生运行;macOS 内嵌验证码被腾讯拒绝后的正解)
+        .route("/api/auth/site-login", post(handle_auth_site_login))
         .route("/api/auth/logout", post(handle_auth_logout))
         .route("/api/auth/remembered", get(handle_auth_remembered))
         .route("/api/auth/remember", post(handle_auth_remember))

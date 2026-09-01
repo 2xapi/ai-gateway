@@ -124,6 +124,15 @@ pub(crate) async fn handle_auth_captcha(State(_s): State<Arc<AppState>>) -> Resp
     }
 }
 
+/// 打开内嵌官网登录窗口;登录态由 site_login 模块在导航信标里回收后落盘,
+/// 主窗自行 reload 呈现已登录。
+pub(crate) async fn handle_auth_site_login(State(_s): State<Arc<AppState>>) -> Response {
+    match crate::site_login::open() {
+        Ok(()) => ok_json(json!({ "opened": true })),
+        Err(e) => err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_WINDOW", &e, None),
+    }
+}
+
 pub(crate) async fn handle_auth_login(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
