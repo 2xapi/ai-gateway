@@ -52,13 +52,33 @@
     }
   }
 
-  // per-run token 鉴权契约:后端向页面注入 window.__TWOXAPI_TOKEN__;存在则每个请求附加 X-2xapi-Token。
-  // 页面与 API 同由本地网关服务(同源),自定义 header 不会触发 CORS 预检,直接附加即可。
-  // 后端把 token 放在 <html data-twoxapi-token="...">,此处桥接到 window 供 tokenHeaders 使用。
+  // API 基址:External 模式(页面由网关 serve)同源用相对路径;Tauri 资产模式
+  // (macOS tauri://localhost / Windows http://tauri.localhost)跨源指向本地网关。
+  const API_BASE = (function () {
+    var o = (global.location && global.location.origin) || "";
+    return /^https?:\/\/tauri|^tauri:|^https:\/\/localhost$/.test(o) ? "http://localhost:8787" : "";
+  })();
+
+  // per-run token 鉴权契约:External 模式由网关注入 <html data-twoxapi-token>;
+  // 资产模式页面不经网关,启动时从公开的 /api/bootstrap 拉取(server 侧
+  // origin_allowed 已挡跨源网页,只有本机 CLI/页面能取)。
   (function () {
     const attr = document.documentElement && document.documentElement.getAttribute("data-twoxapi-token");
     if (attr) global.__TWOXAPI_TOKEN__ = attr;
   })();
+  var tokenPromise = null;
+  function ensureToken() {
+    if (global.__TWOXAPI_TOKEN__) return Promise.resolve();
+    if (tokenPromise) return tokenPromise;
+    tokenPromise = fetch(API_BASE + "/api/bootstrap")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var t = d && d.data && d.data.token;
+        if (t) global.__TWOXAPI_TOKEN__ = t;
+      })
+      .catch(function () { /* 拿不到 token 的请求会被网关 401 并由上层提示 */ });
+    return tokenPromise;
+  }
   function tokenHeaders() {
     const token = global.__TWOXAPI_TOKEN__;
     if (!token) return {};
@@ -66,6 +86,7 @@
   }
 
   async function request(method, path, { body, timeoutMs } = {}) {
+    await ensureToken();
     const opts = {
       method,
       headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()),
@@ -74,7 +95,7 @@
     if (body !== undefined) opts.body = JSON.stringify(body);
     let resp;
     try {
-      resp = await fetchWithTimeout(path, opts, timeoutMs);
+      resp = await fetchWithTimeout(API_BASE + path, opts, timeoutMs);
     } catch (error) {
       if (error && (error.code === "E_TIMEOUT" || error.code === "E_NETWORK")) throw error;
       throw networkError(error);
@@ -93,11 +114,12 @@
 
   // raw 请求（auth 子系统等不走 04 信封的路由）
   async function rawJson(method, path, body, timeoutMs) {
+    await ensureToken();
     const opts = { method, headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin" };
     if (body !== undefined) opts.body = JSON.stringify(body);
     let resp;
     try {
-      resp = await fetchWithTimeout(path, opts, timeoutMs);
+      resp = await fetchWithTimeout(API_BASE + path, opts, timeoutMs);
     } catch (error) {
       if (error && (error.code === "E_TIMEOUT" || error.code === "E_NETWORK")) throw error;
       throw networkError(error);
@@ -148,7 +170,7 @@
   async function claudeDesktopAction(path, way, providerId, fallbackMessage) {
     let resp;
     try {
-      resp = await fetch(path, {
+      resp = await fetch(API_BASE + path, {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ way: way || "", providerId: providerId || "" }),
       });
@@ -200,7 +222,7 @@
     previewProfile: (body) => request("POST", "/api/profiles/preview", { body }),
     applyProfile: (body) => request("POST", "/api/profiles/apply", { body }),
     // ── 健康（不走信封，04 §2）──
-    health: async () => (await fetch("/health")).json(),
+    health: async () => (await fetch(API_BASE + "/health")).json(),
     // ── 关于:版本与更新检查统一走后端信封，避免 CSP 跨域与假版本回退──
     version: () => request("GET", "/api/version"),
     checkUpdate: () => request("GET", "/api/check-update"),
@@ -267,7 +289,7 @@
   plugUpdate: (id) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/update"),
   plugInstallId: (id) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/install"),
     desktopHost: async (providerId, way) => {
-      const resp = await fetch("/api/desktop/host", {
+      const resp = await fetch(API_BASE + "/api/desktop/host", {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ providerId, way }),
       });
@@ -279,7 +301,7 @@
       throw err;
     },
     desktopUnhost: async () => {
-      const resp = await fetch("/api/desktop/unhost", {
+      const resp = await fetch(API_BASE + "/api/desktop/unhost", {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
       });
       const payload = await resp.json().catch(() => ({}));
@@ -296,7 +318,7 @@
     // 错误形态同 desktopHost:{"error": code, "message": msg}
     agentState: (agent) => request("GET", "/api/desktop/" + agent + "/state"),
     agentHost: async (agent, providerId, way) => {
-      const resp = await fetch("/api/desktop/" + agent + "/host", {
+      const resp = await fetch(API_BASE + "/api/desktop/" + agent + "/host", {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), credentials: "same-origin",
         body: JSON.stringify({ providerId: providerId, way: way || "gateway" }),
       });
@@ -308,7 +330,7 @@
       throw err;
     },
     agentUnhost: async (agent) => {
-      const resp = await fetch("/api/desktop/" + agent + "/unhost", {
+      const resp = await fetch(API_BASE + "/api/desktop/" + agent + "/unhost", {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()), body: "{}",
       });
       const v = await resp.json().catch(() => null);
@@ -317,7 +339,7 @@
     },
     // 注入式启动命令(gemini 等;返回 {command, env, hint...},Key 为占位)
     agentStart: async (agent, way, providerId) => {
-      const resp = await fetch("/api/desktop/" + agent + "/start", {
+      const resp = await fetch(API_BASE + "/api/desktop/" + agent + "/start", {
         method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, tokenHeaders()),
         body: JSON.stringify({ way: way || "gateway", providerId: providerId || "" }),
       });

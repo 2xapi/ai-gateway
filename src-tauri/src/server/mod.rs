@@ -68,7 +68,27 @@ fn origin_allowed(headers: &header::HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return true;
     };
-    matches!(origin, "http://127.0.0.1:8787" | "http://localhost:8787")
+    page_origins().contains(&origin)
+}
+
+/// 界面页面允许的来源。External 模式(直接从网关加载页面)是 http://localhost:8787 /
+/// http://127.0.0.1:8787;资产模式(Tauri 内置资产协议,macOS tauri://localhost、
+/// Windows WebView2 http://tauri.localhost)——无端口后缀,正是腾讯国际验证码
+/// 域名白名单(纯主机名 localhost)可匹配的唯一形态。
+#[cfg(not(test))]
+fn page_origins() -> &'static [&'static str] {
+    &[
+        "http://127.0.0.1:8787",
+        "http://localhost:8787",
+        "https://localhost",      // macOS 资产模式(use_https_scheme)
+        "tauri://localhost",      // 旧资产 scheme(过渡兼容)
+        "http://tauri.localhost", // Windows WebView2 资产模式
+    ]
+}
+
+/// 资产模式引导:公开返回本次运行的网关 token(信封格式,前端 ensureToken 读 data.token)。
+async fn handle_bootstrap() -> Response {
+    ok_env(serde_json::json!({ "token": init_gateway_token() }))
 }
 
 fn path_needs_auth(path: &str) -> bool {
@@ -102,15 +122,28 @@ async fn gateway_auth(State(token): State<String>, req: Request<Body>, next: Nex
     if !host_allowed(headers) || !origin_allowed(headers) {
         return err_json(StatusCode::UNAUTHORIZED, "非法请求来源");
     }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // 资产模式页面(tauri://localhost)跨源调 API:预检不带 token,直接放行并回 CORS 头
+    if req.method() == axum::http::Method::OPTIONS {
+        let empty = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap();
+        return with_cors(origin.as_deref(), empty);
+    }
     if !path_needs_auth(req.uri().path()) {
-        return next.run(req).await;
+        let resp = next.run(req).await;
+        return with_cors(origin.as_deref(), resp);
     }
     // 威胁模型:本防护针对「浏览器跨源(DNS rebinding/恶意网页)」。
     // 恶意网页的请求必带恶意 Host(URL 主机名)或跨源 Origin,已被上方拦截。
     // CLI 客户端(Codex/Claude Code/Cursor/Gemini 等)经 /v1/* 代理路径请求时
     // 无 Origin(非浏览器)且无法携带页面 token——视为本机可信进程放行,
     // 与「同用户进程可读本地文件」的既有威胁模型一致。
-    if headers.get(header::ORIGIN).is_none() {
+    if origin.is_none() {
         return next.run(req).await;
     }
     let provided = headers
@@ -118,10 +151,28 @@ async fn gateway_auth(State(token): State<String>, req: Request<Body>, next: Nex
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if provided == token {
-        next.run(req).await
+        let resp = next.run(req).await;
+        with_cors(origin.as_deref(), resp)
     } else {
-        err_json(StatusCode::UNAUTHORIZED, "缺少网关访问凭证")
+        with_cors(origin.as_deref(), err_json(StatusCode::UNAUTHORIZED, "缺少网关访问凭证"))
     }
+}
+
+/// 给既有 Response 追加 CORS 头(资产模式跨源读取响应体必需)。
+#[cfg(not(test))]
+fn with_cors(origin: Option<&str>, mut resp: Response) -> Response {
+    let Some(origin) = origin else { return resp; };
+    if !page_origins().contains(&origin) {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        axum::http::HeaderValue::from_str(origin).unwrap_or(axum::http::HeaderValue::from_static("tauri://localhost")),
+    );
+    headers.insert("Access-Control-Allow-Headers", axum::http::HeaderValue::from_static("Content-Type, X-2xapi-Token, X-Requested-With"));
+    headers.insert("Access-Control-Allow-Methods", axum::http::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"));
+    resp
 }
 
 #[derive(RustEmbed)]
@@ -189,6 +240,9 @@ pub fn build_router(state: AppState) -> Router {
         // --- Static frontend ---
         .route("/", get(serve_index))
         .fallback(serve_static)
+        // --- 资产模式引导(Tauri 资产协议页面不经 axum,无 data-twoxapi-token 注入,
+        //     由页面启动时公开拉取本次运行 token;origin_allowed 挡跨源网页)---
+        .route("/api/bootstrap", get(handle_bootstrap))
         // --- 网关健康（FR-4.1，不走统一响应信封）---
         .route("/health", get(handle_gateway_health))
         // --- 网关代理 /v1/* 和 /*（Codex 可能带或不带 /v1 前缀）---

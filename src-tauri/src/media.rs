@@ -314,7 +314,10 @@ pub async fn handle_serve(
         .and_then(|v| v.to_str().ok())
     {
         let ok = referer.starts_with("http://127.0.0.1:8787")
-            || referer.starts_with("http://localhost:8787");
+            || referer.starts_with("http://localhost:8787")
+            || referer.starts_with("https://localhost")
+            || referer.starts_with("tauri://localhost")
+            || referer.starts_with("http://tauri.localhost");
         if !ok {
             return (StatusCode::FORBIDDEN, "forbidden").into_response();
         }

@@ -357,10 +357,9 @@ fn main() {
             None
         }
     };
-    // 页面用 localhost 域名加载(而非 127.0.0.1):腾讯国际验证码按页面 hostname 做
-    // appId 域名白名单,控制台加的是 localhost;网关本身两个名字都响应,Codex 的
-    // config.toml 仍指向 127.0.0.1(GATEWAY_BASE_URL)不受影响。
-    let app_url = "http://localhost:8787".to_string();
+    // 页面改为 Tauri 资产协议加载(见 setup 内 WebviewUrl::App);网关仍在 127.0.0.1:8787
+    // 供页面跨源调用与 Codex config.toml 指向。此变量仅供日志/诊断提示。
+    let _app_url = "http://localhost:8787".to_string();
 
     // M8:启动器状态 → 先清扫崩溃残留(只清带 launcher.json 标记的目录),再起后台退出监控
     let launcher_state = std::sync::Arc::new(launcher::LauncherState::default());
@@ -502,11 +501,16 @@ fn main() {
             usage_overlay::register_app_handle(app.handle().clone());
             app.manage(state_for_app);
 
+            // 界面走 Tauri 资产协议(macOS: use_https_scheme → https://localhost;
+            // Windows WebView2: http://tauri.localhost):均为无端口后缀的页面来源,
+            // 腾讯国际验证码域名白名单(纯主机名)才能匹配;页面再跨源调用 8787
+            // 网关 API(server 侧 CORS 已放行页面来源)。
             let window = WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::External(app_url.parse().unwrap()),
+                tauri::WebviewUrl::App("index.html".into()),
             )
+            .use_https_scheme(true)
             .title("2xapi Codex Console")
             .inner_size(1000.0, 720.0)
             .min_inner_size(800.0, 600.0)
@@ -516,8 +520,9 @@ fn main() {
             match WebviewWindowBuilder::new(
                 app,
                 usage_overlay::WINDOW_LABEL,
-                tauri::WebviewUrl::External(format!("{app_url}/?overlay=1").parse().unwrap()),
+                tauri::WebviewUrl::App("index.html?overlay=1".into()),
             )
+            .use_https_scheme(true)
             .title("今日 Token 用量")
             .inner_size(320.0, 190.0)
             .decorations(false)
