@@ -357,7 +357,10 @@ fn main() {
             None
         }
     };
-    let app_url = "http://127.0.0.1:8787".to_string();
+    // 页面用 localhost 域名加载(而非 127.0.0.1):腾讯国际验证码按页面 hostname 做
+    // appId 域名白名单,控制台加的是 localhost;网关本身两个名字都响应,Codex 的
+    // config.toml 仍指向 127.0.0.1(GATEWAY_BASE_URL)不受影响。
+    let app_url = "http://localhost:8787".to_string();
 
     // M8:启动器状态 → 先清扫崩溃残留(只清带 launcher.json 标记的目录),再起后台退出监控
     let launcher_state = std::sync::Arc::new(launcher::LauncherState::default());
