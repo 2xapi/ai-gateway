@@ -2962,6 +2962,8 @@ async function doLogin() {
         state.loginBusy = false;
         state.loginPhase = "idle";
         state.loginError = message;
+        var box = document.getElementById("tcaptchaIntlBox");
+        if (box) box.style.display = "none";
         renderLoginForm();
       };
       if (arguments[0]) { fail(arguments[0].message); return; }
@@ -2969,10 +2971,13 @@ async function doLogin() {
       var isIntl = captchaCfg.region === "intl";
       var container = isIntl ? document.getElementById("tcaptchaIntlBox") : null;
       if (isIntl && !container) { fail("验证码容器缺失,请重试"); return; }
+      /* 官网同规格:intl 组件要求容器可见且有 302x60 布局尺寸,构造前先展开 */
+      if (isIntl) container.style.display = "";
       try {
         var onResult = function (res) {
           if (loginSeq !== state.loginRequestSeq) return;
           if (res && res.ret === 2) { /* 用户关闭验证码,回到待登录 */
+            if (container) container.style.display = "none";
             state.loginBusy = false;
             state.loginPhase = "idle";
             renderLoginForm();
@@ -2982,7 +2987,12 @@ async function doLogin() {
           var randstr = String((res && res.randstr) || "").trim();
           /* 与 2xapi 网页端同判:票据为空/trerror_ 前缀/带 errorCode 都是校验失败 */
           if (!ticket || !randstr || ticket.indexOf("trerror_") === 0 || (res && res.errorCode !== undefined)) {
-            fail("验证码校验未通过,请重试");
+            /* 腾讯错误码 1003 = 来源域名不在验证码 appId 的白名单:需到腾讯云验证码控制台
+               给该 appId 加 127.0.0.1 / localhost(国际版严格校验域名,国内版宽松) */
+            var code = res && res.errorCode;
+            fail(code === 1003
+              ? "验证码拒绝本机域名(错误码1003):请在腾讯云验证码控制台为该 appId 添加 127.0.0.1/localhost 域名"
+              : "验证码校验未通过,请重试" + (code !== undefined && code !== null ? "(错误码" + code + ")" : ""));
             return;
           }
           submit(ticket, randstr);

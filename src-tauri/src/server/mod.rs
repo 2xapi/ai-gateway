@@ -36,7 +36,7 @@ use routes_settings::*;
 
 /// 与 tauri.conf.json security.csp 保持一致；Axum 侧必须自己输出，
 /// Tauri 的 CSP 注入只对 tauri:// 资产协议生效，External URL 页面不生效。
-const CSP: &str = "default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+const CSP: &str = "default-src 'self'; connect-src 'self' https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com https://rce.tencentrio.com https://cloudcache.tencentcs.com; img-src 'self' data: https://*.captcha.gtimg.com https://*.qcloud.com; style-src 'self' 'unsafe-inline'; script-src 'self' https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://turing.captcha.gtimg.com https://global.turing.captcha.gtimg.com https://cloudcache.tencentcs.com; frame-src https://turing.captcha.qcloud.com https://ca.turing.captcha.qcloud.com https://www.tycaptcha.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// 本次运行的网关鉴权 token：注入到页面 HTML(data-twoxapi-token)供前端带上
 /// `X-2xapi-Token`，防 DNS rebinding/跨源网页直接调用本地 API。
