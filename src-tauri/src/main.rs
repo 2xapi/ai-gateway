@@ -597,11 +597,19 @@ fn main() {
         // cfg 与 tauri 的 RunEvent::Opened 同门控:该变体仅 macos/ios/android 存在
         //(Windows 无此事件;Mac 全绿零覆盖的 cfg 分支教训,CI 三平台矩阵是唯一防线)
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-        if let tauri::RunEvent::Opened { urls } = event {
+        if let tauri::RunEvent::Opened { ref urls } = event {
             for url in urls {
-                if let Err(e) = handle_deeplink(app_handle, &url) {
+                if let Err(e) = handle_deeplink(app_handle, url) {
                     eprintln!("[deeplink] {e}");
                 }
+            }
+        }
+        // macOS Dock 图标点击/Finder 重开:关窗隐藏(托盘常驻)后点 Dock 找回主窗口。
+        // 与 Opened 同门控思路:Reopen 仅 macOS 存在(Windows 走单一实例策略唤起)。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if !has_visible_windows {
+                show_main_window(app_handle);
             }
         }
     });

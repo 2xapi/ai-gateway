@@ -253,15 +253,32 @@ function showToast(msg, kind) {
 }
 function askConfirm(title, msg) {
   return new Promise(function (resolve) {
+    document.getElementById("cfInput").style.display = "none";
     document.getElementById("cfTitle").textContent = title;
     document.getElementById("cfMsg").textContent = msg;
     state.confirmCb = resolve;
     document.getElementById("confirmMask").style.display = "";
   });
 }
+/* WKWebView 不实现 window.prompt，输入一律走页面内对话框 */
+function askPrompt(title, msg, defVal) {
+  return new Promise(function (resolve) {
+    var inp = document.getElementById("cfInput");
+    document.getElementById("cfTitle").textContent = title;
+    document.getElementById("cfMsg").textContent = msg;
+    inp.style.display = "";
+    inp.value = defVal || "";
+    state.promptCb = resolve;
+    document.getElementById("confirmMask").style.display = "";
+    inp.focus();
+    inp.select();
+  });
+}
 function closeConfirm() {
   document.getElementById("confirmMask").style.display = "none";
+  document.getElementById("cfInput").style.display = "none";
   state.confirmCb = null;
+  if (state.promptCb) { var cb = state.promptCb; state.promptCb = null; cb(null); }
 }
 
 /* ── 数据加载 ── */
@@ -573,8 +590,11 @@ function profileCardHtml() {
 async function doProfileCreate() {
   var provider = lineOf(state.selId);
   if (!provider) { showToast("请先选择供应商", "error"); return; }
-  var name = window.prompt("档案名称（1–40 个字符）", provider.name || "我的 Codex 档案");
-  if (!name) return;
+  var name = await askPrompt("保存配置档案", "档案名称（1–40 个字符）", provider.name || "我的 Codex 档案");
+  if (name === null || name === undefined) return;
+  name = String(name || "").trim();
+  if (!name) { showToast("档案名称不能为空", "error"); return; }
+  if (name.length > 40) { showToast("档案名称不能超过 40 个字符", "error"); return; }
   state.profileBusy = true; render();
   try {
     await api.createProfile(currentProfileDraft(name.trim()));
@@ -4332,10 +4352,14 @@ document.addEventListener("click", function (ev) {
     case "codex-reset-config": doCodexReset("reset-config"); break;
     case "codex-reset-all": doCodexReset("reset-all"); break;
     case "codex-login": doCodexLogin(); break;
-    case "confirm-yes":
+    case "confirm-yes": {
+      var inp = document.getElementById("cfInput");
       document.getElementById("confirmMask").style.display = "none";
+      inp.style.display = "none";
+      if (state.promptCb) { var pcb = state.promptCb; state.promptCb = null; pcb(inp.value); break; }
       if (state.confirmCb) { var cb = state.confirmCb; state.confirmCb = null; cb(true); }
       break;
+    }
     case "confirm-no": closeConfirm(); break;
     case "host": {
       /* 通用平台世界(genericDashHtml 按钮):确认后走泛化路由 host(固定 gateway 通路) */
@@ -4739,5 +4763,18 @@ if (!IS_USAGE_OVERLAY) {
   if (presetSearch) presetSearch.addEventListener("input", function (e) {
     presetQuery = e.target.value || "";
     renderPresetGrid();
+  });
+  /* 页面内输入对话框:Enter 确认 / Esc 取消 */
+  var cfInput = document.getElementById("cfInput");
+  if (cfInput) cfInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); document.getElementById("cfYes").click(); }
+    else if (e.key === "Escape") { e.preventDefault(); closeConfirm(); }
+  });
+  /* 悬浮窗自身的 × 只落盘 enabled=false,不通知主窗;回主窗时重拉一次设置保持「已开启/当前可见」同步 */
+  window.addEventListener("focus", function () {
+    if (state.usageOverlayLoaded && !state.usageOverlayLoading && !state.usageOverlaySaving) {
+      state.usageOverlayLoaded = false;
+      loadUsageOverlaySettings();
+    }
   });
 }
