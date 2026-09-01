@@ -15,6 +15,9 @@ tauri-plugin-updater = "2"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart", "socks"] }
+flate2 = "1"
+zstd = "0.13"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
