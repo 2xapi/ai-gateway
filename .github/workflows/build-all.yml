@@ -79,11 +79,13 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -1)
           root="src-tauri/target/$TARGET/release/bundle"
           mkdir -p release-assets
+          # 更新签名可选:配置了 TAURI_SIGNING_PRIVATE_KEY 才产出 .sig/updater 包
           updater_sig=$(find "$root" -type f -name '*.app.tar.gz.sig' -print -quit)
-          test -n "$updater_sig"
-          updater_file=${updater_sig%.sig}
-          cp "$updater_file" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz"
-          cp "$updater_sig" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz.sig"
+          if [ -n "$updater_sig" ]; then
+            updater_file=${updater_sig%.sig}
+            cp "$updater_file" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz"
+            cp "$updater_sig" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.app.tar.gz.sig"
+          fi
           dmg=$(find "$root" -type f -name '*.dmg' -print -quit)
           test -n "$dmg"
           cp "$dmg" "release-assets/2xapi-codex-console_${version}_macos_${ARCH}.dmg"
@@ -133,11 +135,11 @@ jobs:
           New-Item -ItemType Directory -Force release-assets | Out-Null
           # 只发布 standalone EXE 安装器(不做增量 zip 与 MSI,减少发布面)
           $exeSig = Get-ChildItem "$root/nsis" -Filter "*.exe.sig" | Select-Object -First 1
-          if (-not $exeSig) { throw "Windows installer signature not found" }
-          $exeUpdater = $exeSig.FullName.Substring(0, $exeSig.FullName.Length - 4)
+          $exe = Get-ChildItem "$root/nsis" -Filter "*.exe" | Where-Object { $_.Name -notlike "*.sig" } | Select-Object -First 1
+          if (-not $exe) { throw "Windows installer not found" }
           $name = "2xapi-codex-console_${version}_windows_${{ matrix.arch }}.exe"
-          Copy-Item $exeUpdater "release-assets/$name"
-          Copy-Item $exeSig.FullName "release-assets/$name.sig"
+          Copy-Item $exe.FullName "release-assets/$name"
+          if ($exeSig) { Copy-Item $exeSig.FullName "release-assets/$name.sig" }
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-${{ matrix.arch }}
@@ -165,7 +167,11 @@ jobs:
           mac_arm_sig=$(find release-assets -name '*_macos_aarch64.app.tar.gz.sig' -print -quit)
           mac_x64_sig=$(find release-assets -name '*_macos_x86_64.app.tar.gz.sig' -print -quit)
           win_sig=$(find release-assets -name '*_windows_x86_64.exe.sig' -print -quit)
-          test -n "$mac_arm_sig" && test -n "$mac_x64_sig" && test -n "$win_sig"
+          # 未配置更新签名密钥时没有 .sig:跳过 latest.json,仅发布安装包
+          if [ -z "$mac_arm_sig" ] || [ -z "$mac_x64_sig" ] || [ -z "$win_sig" ]; then
+            echo "updater signatures incomplete - skipping latest.json (installers only)"
+            exit 0
+          fi
           jq -n \
             --arg version "$version" \
             --arg notes "2xapi Codex Console $TAG" \
