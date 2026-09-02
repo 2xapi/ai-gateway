@@ -151,7 +151,9 @@ async fn complete(app: AppHandle, access_token: String, refresh_token: String) -
         let _ = main.eval("location.reload()");
     }
     if let Some(w) = app.get_webview_window("site-login") {
+        // close() 对远程页面窗口偶发不生效(导航拦截瞬间),destroy 兜底确保不残留隐藏窗
         let _ = w.close();
+        let _ = w.destroy();
     }
     Ok(())
 }
