@@ -1,6 +1,6 @@
 [package]
 name = "console-2xapi"
-version = "1.0.18"
+version = "1.0.19"
 edition = "2021"
 description = "2xapi Codex Console"
 repository = "https://github.com/2xapi/ai-gateway"

@@ -2915,7 +2915,13 @@ async function doSiteLogin() {
   /* 官网页登录:后端弹独立窗口加载 2xa.cc.cd/login(验证码在官网域名下原生运行);
      登录态由后端回收落盘并 reload 主窗,此处只负责开窗与提示。 */
   try {
-    await api.siteLogin();
+    /* 资产模式页面优先走 Tauri IPC(进程内),彻底绕开 WebView2 跨源 fetch;
+       External-URL 模式(同源页面)无 __TAURI__,退回 HTTP API。 */
+    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      await window.__TAURI__.core.invoke("open_site_login");
+    } else {
+      await api.siteLogin();
+    }
     showToast("已打开官网登录窗口,完成后自动返回", "ok");
   } catch (e) {
     showToast("打开官网登录窗口失败:" + (e.message || "未知错误"), "error");

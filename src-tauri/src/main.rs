@@ -495,8 +495,18 @@ fn main() {
         });
     }
 
+
+/// 前端「🌐 在官网页登录」按钮直接走 Tauri IPC 开窗,绕开 WebView2 对
+/// http://127.0.0.1:8787 的跨源 fetch(CORS/PNA/HTTPS 自动升级在部分
+/// Windows 环境下会拦截,IPC 是进程内通信,不受影响)。
+#[tauri::command]
+fn open_site_login() -> Result<(), String> {
+    crate::site_login::open()
+}
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![open_site_login])
         .setup(move |app| {
             updater::init(app.handle().clone()).map_err(std::io::Error::other)?;
             usage_overlay::register_app_handle(app.handle().clone());
