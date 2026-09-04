@@ -53,6 +53,16 @@ pub fn init(app: AppHandle) {
 }
 
 /// 打开(或聚焦已开的)官网登录窗口。由 POST /api/auth/site-login 触发。
+#[cfg(target_os = "windows")]
+fn wv_args<'a, R: tauri::Runtime, M: tauri::Manager<R>>(b: tauri::WebviewWindowBuilder<'a, R, M>) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    b.additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HttpsUpgrades,HttpsFirstModeV2,HttpsFirstModeV2ForEngagedSites,HttpsFirstBalancedBrowsingMode")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wv_args<'a, R: tauri::Runtime, M: tauri::Manager<R>>(b: tauri::WebviewWindowBuilder<'a, R, M>) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    b
+}
+
 pub fn open() -> Result<(), String> {
     let app = APP_HANDLE.get().ok_or_else(|| "应用尚未就绪".to_string())?.clone();
     if let Some(w) = app.get_webview_window("site-login") {
@@ -60,11 +70,11 @@ pub fn open() -> Result<(), String> {
         return Ok(());
     }
     let nav_app = app.clone();
-    WebviewWindowBuilder::new(
+    wv_args(WebviewWindowBuilder::new(
         &app,
         "site-login",
         tauri::WebviewUrl::External(SITE_LOGIN_URL.parse().unwrap()),
-    )
+    ))
     .title("2xapi 官网登录")
     .inner_size(460.0, 720.0)
     .min_inner_size(400.0, 560.0)

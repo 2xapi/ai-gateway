@@ -507,11 +507,27 @@ fn main() {
             // Windows WebView2: http://tauri.localhost):均为无端口后缀的页面来源,
             // 腾讯国际验证码域名白名单(纯主机名)才能匹配;页面再跨源调用 8787
             // 网关 API(server 侧 CORS 已放行页面来源)。
-            let window = WebviewWindowBuilder::new(
+
+/// Windows WebView2 与 Edge 同内核,会对页面内 http:// fetch 做"HTTPS 优先"自动升级,
+/// 把 http://127.0.0.1:8787 升成 https:// 导致纯 HTTP 网关 TLS 握手失败
+/// (前端表现: "Failed to fetch")。这里显式关闭该升级,并保留 Tauri 默认禁用项。
+#[cfg(target_os = "windows")]
+const WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HttpsUpgrades,HttpsFirstModeV2,HttpsFirstModeV2ForEngagedSites,HttpsFirstBalancedBrowsingMode";
+
+#[cfg(target_os = "windows")]
+fn wv_args<'a, R: tauri::Runtime, M: tauri::Manager<R>>(b: tauri::WebviewWindowBuilder<'a, R, M>) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    b.additional_browser_args(WEBVIEW_ARGS)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wv_args<'a, R: tauri::Runtime, M: tauri::Manager<R>>(b: tauri::WebviewWindowBuilder<'a, R, M>) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    b
+}
+            let window = wv_args(WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
-            )
+            ))
             .use_https_scheme(true)
             .title("2xapi Codex Console")
             .inner_size(1000.0, 720.0)
@@ -519,11 +535,11 @@ fn main() {
             .build()?;
 
             let overlay_settings = usage_overlay::load_settings(&codex_home).unwrap_or_default();
-            match WebviewWindowBuilder::new(
+            match wv_args(WebviewWindowBuilder::new(
                 app,
                 usage_overlay::WINDOW_LABEL,
                 tauri::WebviewUrl::App("index.html?overlay=1".into()),
-            )
+            ))
             .use_https_scheme(true)
             .title("今日 Token 用量")
             .inner_size(320.0, 190.0)
