@@ -126,12 +126,20 @@ async fn gateway_auth(State(token): State<String>, req: Request<Body>, next: Nex
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    // 资产模式页面(tauri://localhost)跨源调 API:预检不带 token,直接放行并回 CORS 头
+    // 资产模式页面(tauri://localhost / http://tauri.localhost)跨源调 API:
+    // 预检不带 token,直接放行并回 CORS 头;WebView2/Chromium 的私有网络访问
+    // (PNA)还会带 Access-Control-Request-Private-Network,必须回 true 才放行
     if req.method() == axum::http::Method::OPTIONS {
-        let empty = Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .unwrap();
+        let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
+        if headers
+            .get("access-control-request-private-network")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            builder = builder.header("Access-Control-Allow-Private-Network", "true");
+        }
+        let empty = builder.body(Body::empty()).unwrap();
         return with_cors(origin.as_deref(), empty);
     }
     if !path_needs_auth(req.uri().path()) {

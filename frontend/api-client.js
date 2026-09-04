@@ -56,7 +56,9 @@
   // (macOS tauri://localhost / Windows http://tauri.localhost)跨源指向本地网关。
   const API_BASE = (function () {
     var o = (global.location && global.location.origin) || "";
-    return /^https?:\/\/tauri|^tauri:|^https:\/\/localhost$/.test(o) ? "http://localhost:8787" : "";
+    // 用字面 127.0.0.1 而非 localhost:Windows 上 localhost 可能优先解析 ::1,
+    // 而网关只监听 127.0.0.1 → "Failed to fetch"
+    return /^https?:\/\/tauri|^tauri:|^https:\/\/localhost$/.test(o) ? "http://127.0.0.1:8787" : "";
   })();
 
   // per-run token 鉴权契约:External 模式由网关注入 <html data-twoxapi-token>;
