@@ -2884,32 +2884,10 @@ function beginLoginRequest() {
   }, 2500);
 }
 function openLogin() {
-  var loginSeq = ++state.loginRequestSeq;
-  state.loginError = "";
-  state.loginBusy = false;
-  state.loginPhase = "idle";
-  state.loginRememberChoice = true;
-  state.loginFormDirty = false;
-  clearLoginTimer();
-  document.getElementById("loginMask").style.display = "";
-  renderLoginForm();
-  api.remembered().then(function (r) {
-    if (loginSeq !== state.loginRequestSeq || state.loginFormDirty || state.loginBusy) return;
-    if (r && r.remembered) {
-      state.loginEmail = r.email || "";
-      state.loginPassword = r.password || "";
-      state.remembered = true;
-      state.loginRememberChoice = true;
-      renderLoginForm();
-    }
-  }).catch(function () {});
-  api.captchaSettings().then(function (c) {
-    if (loginSeq !== state.loginRequestSeq) return;
-    captchaCfg.enabled = !!(c && c.enabled);
-    captchaCfg.appId = (c && String(c.appId || "")) || "";
-    captchaCfg.region = (c && String(c.region || "cn")) || "cn";
-    if (captchaCfg.enabled && state.loginPhase === "idle") { loadTcaptchaJs(captchaCfg.region, function () {}); renderLoginForm(); }
-  }).catch(function () {});
+  /* 2026-09-07 产品决策:登录只保留「官网页登录」——点「登录 2xapi」直接弹官网窗口,
+     验证码在官网域名下原生运行(macOS/Windows 均真机验证通过);
+     原邮箱/密码+滑块表单因平台兼容差异(macOS 内嵌验证码 1003 必挂)退役,不再展示。 */
+  doSiteLogin();
 }
 async function doSiteLogin() {
   /* 官网页登录:后端弹独立窗口加载 2xa.cc.cd/login(验证码在官网域名下原生运行);
