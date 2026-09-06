@@ -355,7 +355,8 @@ pub async fn login(
 }
 
 pub async fn fetch_key_groups(access_token: &str) -> Result<Value, String> {
-    xapi_request("/groups", reqwest::Method::GET, &json!({}), access_token).await
+    // 部署版站点用户侧分组目录在 /groups/available(/groups 是管理员路由,404;2026-09-06 实测)
+    xapi_request("/groups/available", reqwest::Method::GET, &json!({}), access_token).await
 }
 
 /// 用户 API Key 列表——「一键导入」数据源。

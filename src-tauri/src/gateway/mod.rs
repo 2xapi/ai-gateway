@@ -272,6 +272,19 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     }
 }
 
+/// base_url 末段是否为版本段(v1 / v2 / v4 / v1beta…)。
+/// 已带版本段的 base 直接续接业务路径,不再补 /v1(智谱 /v4 拼出 /v4/v1 404,2026-09-06)。
+/// 只认「v+数字+字母数字」的短段,含 '.' 的域名段(如 v2ex.com)不算。
+fn base_has_version_segment(base: &str) -> bool {
+    base.rsplit('/').next().map_or(false, |seg| {
+        let b = seg.as_bytes();
+        b.len() >= 2
+            && b[0] == b'v'
+            && b[1].is_ascii_digit()
+            && b[1..].iter().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 pub async fn proxy_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch(&s, req, "chat/completions", "codex").await
 }
@@ -1245,9 +1258,10 @@ async fn dispatch(
 
     // chat 上游路径补 /v1(真机实证 2026-08-16:2xa.cc.cd 的 /chat/completions 404,/v1/chat/completions 通;
     // DeepSeek 等根路径站两写皆通——带 /v1 后缀续接、不带补齐,同 dispatch_anthropic 规则)。
+    // base 已带版本段(智谱 /v4 等)则直接续接——再补 /v1 会拼出 /v4/v1/… 404(真机实证 2026-09-06)。
     // responses 不动:2xa 的 /responses 根路径在役(codex 主链),改了会破坏现有流量。
     let base = provider.base_url.trim_end_matches('/');
-    let url = if target_suffix == "chat/completions" && !base.ends_with("/v1") {
+    let url = if target_suffix == "chat/completions" && !base_has_version_segment(base) {
         format!("{base}/v1/{target_suffix}")
     } else {
         format!("{base}/{target_suffix}")
