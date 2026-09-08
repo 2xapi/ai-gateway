@@ -90,10 +90,14 @@ pub fn open() -> Result<(), String> {
                     if let Err(e) = complete(handle.clone(), at, rt_).await {
                         eprintln!("[site-login] 登录态回收失败: {e}");
                         if let Some(w) = handle.get_webview_window("site-login") {
+                            // WKWebView 不实现 JS 对话框(alert 静默无效,同 08dbb93 教训),
+                            // 用 DOM 横幅提示后延迟跳回登录页;错误串去引号/反斜杠防 eval 逃逸。
+                            let safe = e
+                                .replace(['\\', '\'', '"', '\n', '\r'], "")
+                                .replace('{', "(")
+                                .replace('}', ")");
                             let _ = w.eval(&format!(
-                                "alert('登录信息带回失败: {}');location.replace('{}');",
-                                e.replace('\'', ""),
-                                SITE_LOGIN_URL
+                                "(function(){{var b=document.createElement('div');b.textContent='⚠ 登录信息带回失败: {safe}';b.style.cssText='position:fixed;top:30px;left:0;right:0;z-index:2147483647;background:#c0392b;color:#fff;font:12px -apple-system,sans-serif;padding:8px 12px;text-align:center';(document.body||document.documentElement).appendChild(b);setTimeout(function(){{location.replace('{SITE_LOGIN_URL}')}},2500);}})();"
                             ));
                         }
                     }

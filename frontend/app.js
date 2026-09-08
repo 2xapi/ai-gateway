@@ -2902,7 +2902,9 @@ async function doSiteLogin() {
     }
     showToast("已打开官网登录窗口,完成后自动返回", "ok");
   } catch (e) {
-    showToast("打开官网登录窗口失败:" + (e.message || "未知错误"), "error");
+    /* Tauri IPC 的 Err(String) 以纯字符串 reject(无 .message),HTTP 路径抛 Error——两种形态都取到原因 */
+    var reason = (typeof e === "string" ? e : (e && e.message)) || "未知错误";
+    showToast("打开官网登录窗口失败:" + reason, "error");
   }
 }
 
